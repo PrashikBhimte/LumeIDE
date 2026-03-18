@@ -1,37 +1,61 @@
 import os
+from pathlib import Path
+from typing import Dict, List, Union
 
-def scan_directory(path):
+def scan_directory_to_tree(path: str) -> Dict[str, Union[str, List]]:
     """
-    Scans a directory and returns a tree structure.
+    Scans a directory and returns a JSON-ready tree structure.
+
+    Args:
+        path: The absolute or relative path to the directory.
+
+    Returns:
+        A dictionary representing the directory tree.
+        Example:
+        {
+            "name": "directory_name",
+            "path": "/path/to/directory",
+            "type": "directory",
+            "children": [
+                {
+                    "name": "file.txt",
+                    "path": "/path/to/directory/file.txt",
+                    "type": "file"
+                },
+                {
+                    "name": "subdirectory",
+                    "path": "/path/to/directory/subdirectory",
+                    "type": "directory",
+                    "children": []
+                }
+            ]
+        }
     """
-    root = {'name': os.path.basename(path), 'path': path, 'is_dir': True, 'children': []}
-    try:
-        for entry in os.scandir(path):
-            if entry.name.startswith('.') or entry.name == '__pycache__':
-                continue
-            if entry.is_dir():
-                root['children'].append(scan_directory(entry.path))
-            else:
-                root['children'].append({'name': entry.name, 'path': entry.path, 'is_dir': False})
-    except OSError:
-        return None
-    return root
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Path does not exist: {path}")
 
-if __name__ == '__main__':
-    import json
-    import shutil
+    if not p.is_dir():
+       return {
+            "name": p.name,
+            "path": str(p.resolve()),
+            "type": "file",
+        }
 
-    # Create a dummy directory structure for testing
-    if not os.path.exists('test_dir'):
-        os.makedirs('test_dir/subdir')
-        with open('test_dir/file1.txt', 'w') as f:
-            f.write('hello')
-        with open('test_dir/subdir/file2.txt', 'w') as f:
-            f.write('world')
+    dir_info = {
+        "name": p.name,
+        "path": str(p.resolve()),
+        "type": "directory",
+        "children": []
+    }
 
-    tree = scan_directory('test_dir')
-    print(json.dumps(tree, indent=4))
-
-    # Clean up the dummy directory
-    if os.path.exists('test_dir'):
-        shutil.rmtree('test_dir')
+    for item in sorted(p.iterdir()):
+        if item.is_dir():
+            dir_info["children"].append(scan_directory_to_tree(str(item)))
+        else:
+            dir_info["children"].append({
+                "name": item.name,
+                "path": str(item.resolve()),
+                "type": "file"
+            })
+    return dir_info

@@ -39,13 +39,48 @@ class ChronicleDB:
         );
         """
 
+        create_settings_table = """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
+
         try:
             cursor.execute(create_projects_table)
             cursor.execute(create_tasks_table)
+            cursor.execute(create_settings_table)
             self.connection.commit()
-            print("Tables 'projects' and 'tasks' created successfully.")
+            print("Tables 'projects', 'tasks', and 'settings' created successfully.")
         except sqlite3.Error as e:
             print(f"Error creating tables: {e}")
+
+    def save_setting(self, key, value):
+        if not self.connection:
+            print("Not connected to the database.")
+            return
+        
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+            self.connection.commit()
+            print(f"Setting '{key}' saved.")
+        except sqlite3.Error as e:
+            print(f"Error saving setting: {e}")
+
+    def get_setting(self, key):
+        if not self.connection:
+            print("Not connected to the database.")
+            return None
+        
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = cursor.fetchone()
+            return row[0] if row else None
+        except sqlite3.Error as e:
+            print(f"Error getting setting: {e}")
+            return None
 
     def register_project(self, name, path):
         if not self.connection:

@@ -2,6 +2,49 @@ import os
 from pathlib import Path
 from typing import Dict, List, Union
 
+
+def tool_read_file(path: str) -> str:
+    """
+    Reads the content of a file at the given path.
+    This tool is meant to be used by the Gemini model.
+    
+    Args:
+        path: Path to the file to read
+        
+    Returns:
+        File contents as string or error message
+    """
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except FileNotFoundError:
+        return f"Error: File not found at path: {path}"
+    except Exception as e:
+        return f"Error reading file at {path}: {e}"
+
+
+def tool_write_file(path: str, content: str) -> str:
+    """
+    Writes or overwrites content to a file at the specified path.
+    
+    Args:
+        path: Path to the file to write
+        content: Content to write to the file
+        
+    Returns:
+        Success or error message
+    """
+    try:
+        safe_path = os.path.normpath(path)
+        # Ensure directories exist
+        os.makedirs(os.path.dirname(safe_path), exist_ok=True)
+        with open(safe_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return f"Successfully wrote to {path}"
+    except Exception as e:
+        return f"Error writing to file at {path}: {str(e)}"
+
+
 def scan_directory_to_tree(path: str) -> Dict[str, Union[str, List]]:
     """
     Scans a directory and returns a JSON-ready tree structure.

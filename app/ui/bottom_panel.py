@@ -9,9 +9,15 @@ from PyQt6.QtWidgets import (
     QTabWidget, QPushButton, QLabel, QComboBox, QLineEdit
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QTextCursor
+
+import mistune
 
 from app.engine.dispatcher import CommandDispatcher
+
+class CodeBlockRenderer(mistune.HTMLRenderer):
+    def block_code(self, code, lang=None):
+        return f'<pre style="background-color: #2E3440; color: #D8DEE9; padding: 10px; border-radius: 4px;"><code>{mistune.escape(code)}</code></pre>'
 
 
 class UnifiedShell(QWidget):
@@ -22,6 +28,7 @@ class UnifiedShell(QWidget):
     def __init__(self, command_dispatcher: CommandDispatcher, parent=None):
         super().__init__(parent)
         self.command_dispatcher = command_dispatcher
+        self._is_running = False
         self._setup_ui()
 
     def _setup_ui(self):
@@ -31,68 +38,109 @@ class UnifiedShell(QWidget):
         layout.setSpacing(0)
 
         self.output_view = QTextEdit()
-        self.output_view.setFont(QFont("Consolas", 10))
         self.output_view.setReadOnly(True)
-        self.output_view.setStyleSheet("""
-            QTextEdit {
-                background-color: #1E1E1E;
-                color: #D4D4D4;
-                border: none;
-                padding: 8px;
-            }
-        """)
-
+        self.output_view.setStyleSheet("border: none; background-color: #1E1E1E; color: #D4D4D4;")
+        
+        # Input area
+        input_layout = QHBoxLayout()
+        input_layout.setContentsMargins(5, 5, 5, 5)
+        
         self.input_line = QLineEdit()
-        self.input_line.setFont(QFont("Consolas", 10))
+        self.input_line.setPlaceholderText("Type a command or ask Aura...")
+        self.input_line.returnPressed.connect(self._on_command_entered)
         self.input_line.setStyleSheet("""
             QLineEdit {
-                background-color: #252526;
-                color: #D4D4D4;
                 border: 1px solid #333;
-                padding: 4px 8px;
+                background-color: #252526;
+                padding: 5px;
+                color: #D4D4D4;
             }
         """)
-        self.input_line.setPlaceholderText("Enter a command or ask Aura...")
-        self.input_line.returnPressed.connect(self._on_command_entered)
+        
+        input_layout.addWidget(self.input_line)
+
+        input_container = QWidget()
+        input_container.setLayout(input_layout)
         
         layout.addWidget(self.output_view)
-        layout.addWidget(self.input_line)
+        layout.addWidget(input_container)
+        self.append_prompt()
+
+    def append_prompt(self):
+        self.output_view.append("> ")
+        self.output_view.moveCursor(QTextCursor.MoveOperation.End)
+
 
     def _on_command_entered(self):
         """Handle command entry."""
+        if self._is_running:
+            return
+            
         command = self.input_line.text()
         if not command:
             return
 
-        self.input_line.clear()
         self.append_output(f"> {command}", "gray")
+        self.input_line.clear()
+        
+        result = self.command_dispatcher.dispatch(command)
+        
+        if result:
+            output, color = result
+            self.append_output(output, color)
+            self.append_prompt()
+        else:
+            # Asynchronous command, handled by signals
+            self._is_running = True
+            self.input_line.setEnabled(False)
 
-        output, color = self.command_dispatcher.dispatch(command)
-        self.append_output(output, color)
+
+    def on_aura_started_thinking(self):
+        self.append_output("✨ Aura is thinking...", "blue")
+
+    def on_aura_tool_used(self, tool_name, tool_args):
+        self.append_output(f"[System]: Aura is using {tool_name}...", "gray")
+
+    def on_aura_finished(self, result):
+        if result.error:
+            self.append_output(f"Aura Error: {result.error}", "red")
+        else:
+            self.append_output(result.text, "blue")
+        
+        self._is_running = False
+        self.input_line.setEnabled(True)
+        self.input_line.setFocus()
+        self.append_prompt()
+
 
     def append_output(self, text: str, color: str = None):
         """Append text to the output view with optional color."""
-        color_map = {
-            "green": "#4EC9B0",  # Terminal output
-            "blue": "#569CD6",   # Aura response
-            "red": "#F14C4C",    # Errors
-            "gray": "#888888"    # Command echo
-        }
-        
-        if color and color.startswith("#"):
-            hex_color = color
+        if color == "blue": # Aura's markdown response
+            renderer = CodeBlockRenderer()
+            markdown = mistune.create_markdown(renderer=renderer)
+            html = markdown(text)
+            self.output_view.append(html)
         else:
-            hex_color = color_map.get(color, "#D4D4D4") # Default to standard text color
+            color_map = {
+                "green": "#4EC9B0",
+                "red": "#F14C4C",
+                "gray": "#888888"
+            }
+            hex_color = color_map.get(color, "#D4D4D4")
+            
+            if color and color.startswith("#"):
+                hex_color = color
+            
+            formatted_text = f'<pre style="white-space: pre-wrap; margin: 0;">{text}</pre>'
+            self.output_view.append(f'<div style="color: {hex_color};">{formatted_text}</div>')
         
-        # Pre-wrap to avoid long lines
-        formatted_text = f'<pre style="white-space: pre-wrap; margin: 0; font-family: Consolas, monospace;">{text}</pre>'
-
-        self.output_view.append(f'<div style="color: {hex_color};">{formatted_text}</div>')
         self.output_view.verticalScrollBar().setValue(self.output_view.verticalScrollBar().maximum())
+
 
     def clear_output(self):
         """Clear the output view."""
         self.output_view.clear()
+        self.append_prompt()
 
 
 class LogViewer(QTextEdit):

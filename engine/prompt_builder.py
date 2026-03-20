@@ -14,13 +14,11 @@ def create_system_prompt(context: ProjectContext) -> str:
         prompt_lines.append("The project's virtual environment is located at: '{venv_path}'.")
 
     prompt_lines.extend([
-        "
-Your task is to provide expert guidance, code, and solutions.",
+        "Your task is to provide expert guidance, code, and solutions.",
         "Always consider the project's context and technology stack when formulating your responses."
     ])
     
-    return "
-".join(prompt_lines).format(
+    return "".join(prompt_lines).format(
         tech_stack=context.tech_stack,
         description=context.description,
         venv_path=context.venv_path or "Not specified"
@@ -43,6 +41,5 @@ if __name__ == '__main__':
         description="A simple web scraper.",
         tech_stack="Python, BeautifulSoup"
     )
-    print("
---- Prompt with missing venv ---")
+    print("--- Prompt with missing venv ---")
     print(create_system_prompt(project_ctx_no_venv))

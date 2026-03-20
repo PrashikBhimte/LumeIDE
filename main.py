@@ -12,7 +12,13 @@ def main():
     Initializes and runs the Lume IDE application.
     """
     app = QApplication(sys.argv)
-    app.setStyleSheet(DARK_PLUS_QSS)
+    
+    # Load Dark+ High Contrast theme
+    try:
+        with open("dark_plus_high_contrast.qss", "r") as f:
+            app.setStyleSheet(f.read())
+    except FileNotFoundError:
+        print("Stylesheet 'dark_plus_high_contrast.qss' not found. Using default styles.")
 
     main_window = MainWindow()
     main_window.show()

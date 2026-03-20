@@ -1,73 +1,54 @@
-"""
-Aura Client Module for LumeIDE
-
-Client for interacting with Google's Gemini models using the latest google-genai SDK.
-"""
-
 import os
-import json
 import threading
-from typing import Optional, Callable, Dict, Any, List
 from dataclasses import dataclass
+from typing import Optional, List, Dict, Any
+
+from PyQt6.QtCore import QObject, pyqtSignal, QThread
 
 # Use the latest google-genai SDK
 from google import genai
+from google.genai import types
 
-
-def tool_read_file(path: str) -> str:
-    """
-    Reads the content of a file at the given path.
-    This tool is meant to be used by the Gemini model.
-    """
-    try:
-        normalized = os.path.normpath(path)
-        with open(normalized, 'r', encoding='utf-8') as f:
-            return f.read()
-    except FileNotFoundError:
-        return f"Error: File not found at path: {path}"
-    except Exception as e:
-        return f"Error reading file at {path}: {e}"
-
-
-def tool_write_file(path: str, content: str) -> str:
-    """
-    Writes or overwrites content to a file at the specified path.
-    """
-    try:
-        normalized = os.path.normpath(path)
-        # Ensure directories exist
-        os.makedirs(os.path.dirname(normalized), exist_ok=True)
-        with open(normalized, 'w', encoding='utf-8') as f:
-            f.write(content)
-        return f"Successfully wrote to {path}"
-    except Exception as e:
-        return f"Error writing to file at {path}: {str(e)}"
+from app.engine.tools import tool_read_file, tool_write_file
 
 
 @dataclass
 class GenerationResult:
     """Result of a generation request."""
     text: Optional[str]
-    candidates: Optional[List]
-    prompt_feedback: Optional[Dict]
+    candidates: Optional[List[Any]] = None
+    prompt_feedback: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
 
+class AuraWorker(QObject):
+    finished = pyqtSignal(object)
 
-class AuraClient:
+    def __init__(self, client_instance, prompt_text, tools, system_instruction):
+        super().__init__()
+        self.client_instance = client_instance
+        self.prompt_text = prompt_text
+        self.tools = tools
+        self.system_instruction = system_instruction
+
+    def run(self):
+        result = self.client_instance.generate_response_sync(
+            self.prompt_text, 
+            self.tools, 
+            self.system_instruction
+        )
+        self.finished.emit(result)
+
+class AuraClient(QObject):
     """
     A client for interacting with Google's Gemini models.
-    Supports streaming responses and abort mechanism.
+    Powered by the new google-genai SDK.
     """
-
+    started_thinking = pyqtSignal()
+    tool_used = pyqtSignal(str, dict)
+    finished = pyqtSignal(object)
+    
     def __init__(self, api_key: str = None, model_name: str = "gemini-2.5-flash"):
-        """
-        Initializes the AuraClient.
-
-        Args:
-            api_key: The Google AI API key. If not provided, it's read from
-                     the GEMINI_API_KEY environment variable.
-            model_name: The name of the Gemini model to use.
-        """
+        super().__init__()
         if api_key is None:
             api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
@@ -78,234 +59,116 @@ class AuraClient:
 
         self.api_key = api_key
         self.model_name = model_name
-        self._client = None
-        self._current_response = None
+        self.client = None
         self._abort_event = threading.Event()
-        self._is_streaming = False
-        self._callbacks = []
-
-        # Initialize client
+        
+        self.tool_functions = {
+            "tool_read_file": tool_read_file,
+            "tool_write_file": tool_write_file,
+        }
+        self.thread = None
+        self.worker = None
+        
+        # Initialize immediately
         self._initialize_client()
 
     def _initialize_client(self):
-        """Initialize the Gemini client."""
         try:
-            self._client = genai.Client(api_key=self.api_key)
+            # NEW SDK: Direct Client Initialization
+            self.client = genai.Client(api_key=self.api_key)
             print(f"AuraClient initialized with model: {self.model_name}")
         except Exception as e:
             print(f"Error initializing Gemini client: {e}")
             raise
 
-    def register_callback(self, callback: Callable[[str], None]):
-        """
-        Register a callback for streaming responses.
+    def generate_response(
+        self,
+        prompt_text: str,
+        tools: List = None,
+        system_instruction: str = None
+    ):
+        self.thread = QThread()
+        # Pass 'self' so the worker can call our sync method
+        self.worker = AuraWorker(self, prompt_text, tools, system_instruction)
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self.on_generation_finished)
+        self.thread.finished.connect(self.thread.deleteLater)
+        
+        self.started_thinking.emit()
+        self.thread.start()
 
-        Args:
-            callback: Function that receives text chunks as they arrive
-        """
-        self._callbacks.append(callback)
+    def on_generation_finished(self, result):
+        self.finished.emit(result)
+        self.thread.quit()
 
-    def unregister_callback(self, callback: Callable[[str], None]):
-        """Remove a registered callback."""
-        if callback in self._callbacks:
-            self._callbacks.remove(callback)
-
-    def _notify_callbacks(self, text: str):
-        """Notify all registered callbacks of new text."""
-        for callback in self._callbacks:
-            try:
-                callback(text)
-            except Exception as e:
-                print(f"Callback error: {e}")
-
-    def send_prompt(
+    def generate_response_sync(
         self,
         prompt_text: str,
         tools: List = None,
         system_instruction: str = None,
-        stream: bool = True
+        stream: bool = False 
     ) -> GenerationResult:
-        """
-        Sends a prompt to the Gemini model and gets a response.
-        Supports streaming for real-time responses.
-
-        Args:
-            prompt_text: The user's prompt
-            tools: List of tool functions to make available to the model
-            system_instruction: System-level instructions
-            stream: Whether to stream the response
-
-        Returns:
-            GenerationResult with response data
-        """
-        self._abort_event.clear()
-        self._is_streaming = stream
-
         try:
-            # Build generation config
-            config = genai.types.GenerateContentConfig(
-                tools=tools or [
-                    genai.types.Tool(
-                        function_declarations=[
-                            {
-                                "name": "read_file",
-                                "description": "Read the content of a file at the given path",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "path": {"type": "string", "description": "Path to the file to read"}
-                                    },
-                                    "required": ["path"]
-                                }
-                            },
-                            {
-                                "name": "write_file",
-                                "description": "Write or overwrite content to a file",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "path": {"type": "string", "description": "Path to the file to write"},
-                                        "content": {"type": "string", "description": "Content to write"}
-                                    },
-                                    "required": ["path", "content"]
-                                }
-                            }
-                        ]
-                    )
-                ],
-                system_instruction=system_instruction
+            # 1. NEW SDK: Setup Configuration
+            tools_list = tools or [tool_read_file, tool_write_file]
+            config = types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                tools=tools_list,
+                # We disable automatic function calling so we can emit our UI signals manually
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                temperature=0.2 # Lower temperature is better for coding consistency
             )
 
-            # Generate content
-            full_response = ""
+            # 2. NEW SDK: Create Chat Session
+            chat = self.client.chats.create(
+                model=self.model_name,
+                config=config
+            )
+            
+            # 3. Send initial prompt
+            response = chat.send_message(prompt_text)
 
-            if stream:
-                # Streaming response
-                response_stream = self._client.models.generate_content_stream(
-                    model=self.model_name,
-                    contents=prompt_text,
-                    config=config
-                )
+            # 4. NEW SDK: Cleaner Function Call Extraction
+            while response.function_calls:
+                # Grab the first function call requested by the model
+                function_call = response.function_calls[0]
+                tool_name = function_call.name
+                tool_args = function_call.args
 
-                for chunk in response_stream:
-                    if self._abort_event.is_set():
-                        # Abort was requested
-                        return GenerationResult(
-                            text=full_response,
-                            candidates=None,
-                            prompt_feedback=None,
-                            error="Generation aborted by user"
+                # Alert the UI that a tool is being used
+                self.tool_used.emit(tool_name, tool_args)
+
+                if tool_name in self.tool_functions:
+                    tool_function = self.tool_functions[tool_name]
+                    try:
+                        # Execute the python function
+                        tool_result = tool_function(**tool_args)
+                        
+                        # NEW SDK: Send the result back using Part.from_function_response
+                        response = chat.send_message(
+                            types.Part.from_function_response(
+                                name=tool_name,
+                                response={"result": str(tool_result)}
+                            )
                         )
-
-                    if chunk.text:
-                        full_response += chunk.text
-                        self._notify_callbacks(chunk.text)
-
-                self._is_streaming = False
-                return GenerationResult(
-                    text=full_response,
-                    candidates=None,
-                    prompt_feedback=None
-                )
-            else:
-                # Non-streaming response
-                response = self._client.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt_text,
-                    config=config
-                )
-
-                return GenerationResult(
-                    text=response.text if hasattr(response, 'text') else None,
-                    candidates=response.candidates if hasattr(response, 'candidates') else None,
-                    prompt_feedback=response.prompt_feedback if hasattr(response, 'prompt_feedback') else None
-                )
-
-        except Exception as e:
-            error_msg = str(e)
-            print(f"Error generating content: {error_msg}")
+                    except Exception as e:
+                        print(f"Error executing tool {tool_name}: {e}")
+                        response = chat.send_message(
+                            types.Part.from_function_response(
+                                name=tool_name,
+                                response={"error": str(e)}
+                            )
+                        )
+                else:
+                    print(f"Unknown tool: {tool_name}")
+                    break
+            
             return GenerationResult(
-                text=None,
-                candidates=None,
-                prompt_feedback=None,
-                error=error_msg
+                text=response.text,
+                candidates=getattr(response, 'candidates', None),
+                prompt_feedback=getattr(response, 'prompt_feedback', None)
             )
 
-    def abort(self):
-        """
-        Abort the current generation request.
-        Sets an internal flag that causes streaming to stop.
-        """
-        if self._is_streaming:
-            self._abort_event.set()
-            self._is_streaming = False
-            print("Generation abort requested")
-
-    def is_generating(self) -> bool:
-        """Check if a generation is currently in progress."""
-        return self._is_streaming
-
-    def get_current_response(self) -> Optional[str]:
-        """Get the current accumulated response text."""
-        return self._current_response
-
-    def configure_model(self, model_name: str):
-        """Change the active model."""
-        self.model_name = model_name
-        print(f"Model changed to: {model_name}")
-
-
-# Vault Toolset - Additional tools for Aura
-class VaultToolset:
-    """
-    Additional tools for file operations and system commands.
-    """
-
-    def __init__(self, working_dir: str = None):
-        self.working_dir = working_dir or os.getcwd()
-
-    def pip_freeze(self) -> str:
-        """
-        Get list of installed packages using pip freeze.
-        Returns the output of pip freeze command.
-        """
-        import subprocess
-        try:
-            # Try to use venv pip first
-            venv_pip = os.path.join(self.working_dir, 'venv', 'Scripts', 'pip.exe')
-            if os.path.exists(venv_pip):
-                result = subprocess.run(
-                    [venv_pip, 'freeze'],
-                    capture_output=True,
-                    text=True,
-                    cwd=self.working_dir,
-                    timeout=30
-                )
-            else:
-                result = subprocess.run(
-                    ['pip', 'freeze'],
-                    capture_output=True,
-                    text=True,
-                    cwd=self.working_dir,
-                    timeout=30
-                )
-
-            if result.returncode == 0:
-                return result.stdout
-            else:
-                return f"Error: {result.stderr}"
-        except subprocess.TimeoutExpired:
-            return "Error: pip freeze timed out"
         except Exception as e:
-            return f"Error running pip freeze: {str(e)}"
-
-    def get_venv_packages(self) -> List[str]:
-        """Get list of installed packages from venv."""
-        freeze_output = self.pip_freeze()
-        if freeze_output.startswith("Error:"):
-            return []
-        return [line.strip() for line in freeze_output.strip().split('\n') if line.strip()]
-
-
-# Export
-__all__ = ['AuraClient', 'VaultToolset', 'GenerationResult', 'tool_read_file', 'tool_write_file']
+            return GenerationResult(text=None, error=str(e))

@@ -26,15 +26,16 @@ class CommandDispatcher:
         self.editor_area = editor_area
         self.terminal_history: list[str] = []
 
-    def dispatch(self, command: str) -> tuple[str, str]:
+    def dispatch(self, command: str) -> Optional[tuple[str, str]]:
         """
-        Dispatches a command and returns the output and color.
+        Dispatches a command. For local commands, it returns the output and color.
+        For Aura commands, it initiates the generation and returns None.
 
         Args:
             command: The command string from the user.
 
         Returns:
-            A tuple of (output, color).
+            A tuple of (output, color) for local commands, otherwise None.
         """
         self.terminal_history.append(f"User: {command}")
         if len(self.terminal_history) > 10:
@@ -70,23 +71,25 @@ class CommandDispatcher:
 
         # Aura Brain
         else:
-            terminal_context = "".join(self.terminal_history[-5:])
-            prompt = f"Terminal Context:{terminal_context}User Query: {command}"
-            
-            # This is a simplified call. The actual implementation might need more setup.
-            # Assuming aura_client has a method like `send_prompt`
-            # and it returns a result object with a 'text' attribute.
-            response = self.aura_client.send_prompt(prompt, stream=False)
-            
-            if response.error:
-                output = f"Aura Error: {response.error}"
-                color = "red"
-            else:
-                output = response.text
-                color = "blue"
+            active_file_path = self.editor_area.get_current_file()
+            file_content = ""
+            if active_file_path:
+                try:
+                    with open(active_file_path, "r") as f:
+                        file_content = f.read()
+                except Exception:
+                    # Silently fail for now, or add logging
+                    pass
 
-            self.terminal_history.append(f"Aura: {output}")
-            return output, color
+            terminal_context = "\n".join(self.terminal_history[-5:])
+            
+            prompt = f"Active File: {active_file_path}\n"
+            prompt += f"File Content:\n```\n{file_content}\n```\n\n"
+            prompt += f"Terminal Context:\n{terminal_context}\n\n"
+            prompt += f"User Query: {command}"
+
+            self.aura_client.generate_response(prompt)
+            return None
 
     def _run_local_command(self, command: str) -> str:
         """
@@ -110,10 +113,10 @@ class CommandDispatcher:
 
             # Use venv python if specified
             if command.strip().startswith("python ") and self.project_context.venv_path:
-                 command = command.replace("python", os.path.join(self.project_context.venv_path, "Scripts", "python.exe"), 1)
+                 command = command.replace("python", os.path.normpath(os.path.join(self.project_context.venv_path, "Scripts", "python.exe")), 1)
             
             if command.strip().startswith("pip ") and self.project_context.venv_path:
-                 command = command.replace("pip", os.path.join(self.project_context.venv_path, "Scripts", "pip.exe"), 1)
+                 command = command.replace("pip", os.path.normpath(os.path.join(self.project_context.venv_path, "Scripts", "pip.exe")), 1)
 
 
             result = subprocess.run(

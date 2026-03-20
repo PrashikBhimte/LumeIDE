@@ -31,7 +31,7 @@ from app.ui.bottom_panel import BottomPanel
 from app.storage.database import ChronicleDB
 from app.engine.dispatcher import CommandDispatcher
 from app.models.project_context import ProjectContext
-from app.engine.aura_client import AuraClient, VaultToolset
+from app.engine.aura_client import AuraClient
 from app.utils.venv_detector import VenvDetector
 from app.ui.onboarding import ProjectOnboardingDialog
 
@@ -75,7 +75,6 @@ class MainWindow(QMainWindow):
 
         # Engine components
         self.venv_detector = VenvDetector()
-        self.vault_tools = VaultToolset()
         self.editor_area = EditorArea() # Editor area needs to be created before dispatcher
 
         # Try to initialize Aura client (may fail if no API key)
@@ -270,6 +269,23 @@ class MainWindow(QMainWindow):
         # Editor area
         self.editor_area.file_saved.connect(self._on_file_saved)
         self.editor_area.tab_changed.connect(self._on_tab_changed)
+
+        # Aura client signals
+        if self.aura_client:
+            self.aura_client.started_thinking.connect(
+                self.bottom_panel.shell.on_aura_started_thinking
+            )
+            self.aura_client.tool_used.connect(self._on_aura_tool_used)
+            self.aura_client.finished.connect(
+                self.bottom_panel.shell.on_aura_finished
+            )
+
+    def _on_aura_tool_used(self, tool_name, tool_args):
+        self.bottom_panel.shell.on_aura_tool_used(tool_name, tool_args)
+        if tool_name == 'write_file':
+            file_path = tool_args.get('file_path')
+            if file_path:
+                self.editor_area.open_file(file_path)
 
     def _on_view_changed(self, view_id: str):
         """Handle activity bar view changes."""

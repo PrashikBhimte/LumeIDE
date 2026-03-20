@@ -1,18 +1,67 @@
-"""
-Editor Area Module for LumeIDE
-
-Provides the tabbed code editor area with file management.
-"""
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
-    QTextEdit, QPushButton, QLabel, QMessageBox
+    QTextEdit, QPushButton, QLabel, QMessageBox, QPlainTextEdit, QLineEdit
 )
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont, QTextCursor
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QRect, QEvent
+from PyQt6.QtGui import (
+    QFont, QTextCursor, QColor, QTextFormat, QPainter, QPalette, QTextDocument
+)
 
 
-class CodeEditor(QTextEdit):
+class SearchBar(QWidget):
+    search_requested = pyqtSignal(str, bool)
+    replace_requested = pyqtSignal(str, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search...")
+        self.search_input.returnPressed.connect(self.search_next)
+        layout.addWidget(self.search_input)
+
+        self.next_button = QPushButton("Next")
+        self.next_button.clicked.connect(self.search_next)
+        layout.addWidget(self.next_button)
+
+        self.prev_button = QPushButton("Previous")
+        self.prev_button.clicked.connect(self.search_prev)
+        layout.addWidget(self.prev_button)
+
+        self.close_button = QPushButton("×")
+        self.close_button.clicked.connect(self.hide)
+        layout.addWidget(self.close_button)
+
+    def search_next(self):
+        text = self.search_input.text()
+        if text:
+            self.search_requested.emit(text, True)
+
+    def search_prev(self):
+        text = self.search_input.text()
+        if text:
+            self.search_requested.emit(text, False)
+
+
+class LineNumberArea(QWidget):
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.editor = editor
+
+    def sizeHint(self):
+        return QSize(self.editor.lineNumberAreaWidth(), 0)
+
+    def paintEvent(self, event):
+        self.editor.lineNumberAreaPaintEvent(event)
+
+
+class CodeEditor(QPlainTextEdit):
     """
     Simple code editor widget with file tracking.
     """
@@ -25,9 +74,11 @@ class CodeEditor(QTextEdit):
         super().__init__(parent)
         self.file_path = file_path
         self.original_content = ""
+        self.lineNumberArea = LineNumberArea(self)
         self._setup_ui()
         self._connect_signals()
-    
+        self.updateLineNumberAreaWidth(0)
+
     def _setup_ui(self):
         """Initialize the editor UI."""
         self.setFont(QFont("Consolas", 11))
@@ -44,14 +95,90 @@ class CodeEditor(QTextEdit):
         """Connect signals."""
         self.textChanged.connect(self.content_changed.emit)
         self.cursorPositionChanged.connect(self._on_cursor_changed)
-    
+        self.blockCountChanged.connect(self.updateLineNumberAreaWidth)
+        self.updateRequest.connect(self.updateLineNumberArea)
+
     def _on_cursor_changed(self):
         """Handle cursor position change."""
         cursor = self.textCursor()
         line = cursor.blockNumber() + 1
         column = cursor.columnNumber() + 1
         self.cursor_changed.emit(line, column)
-    
+        self.highlightCurrentLine()
+
+    def highlightCurrentLine(self):
+        extraSelections = []
+        if not self.isReadOnly():
+            selection = QTextEdit.ExtraSelection()
+            lineColor = QColor("#283457")
+            selection.format.setBackground(lineColor)
+            selection.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
+            selection.cursor = self.textCursor()
+            selection.cursor.clearSelection()
+            extraSelections.append(selection)
+        self.setExtraSelections(extraSelections)
+
+    def search(self, text, forward=True):
+        find_flags = QTextDocument.FindFlag()
+        if not forward:
+            find_flags |= QTextDocument.FindFlag.FindBackward
+
+        found = self.find(text, find_flags)
+
+        if not found:
+            # Wrap search
+            cursor = self.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.Start if forward else QTextCursor.MoveOperation.End)
+            self.setTextCursor(cursor)
+            self.find(text, find_flags)
+
+    def lineNumberAreaWidth(self):
+        digits = 1
+        max_val = max(1, self.blockCount())
+        while max_val >= 10:
+            max_val /= 10
+            digits += 1
+        space = 3 + self.fontMetrics().horizontalAdvance('9') * digits
+        return space
+
+    def updateLineNumberAreaWidth(self, _):
+        self.setViewportMargins(self.lineNumberAreaWidth(), 0, 0, 0)
+
+    def updateLineNumberArea(self, rect, dy):
+        if dy:
+            self.lineNumberArea.scroll(0, dy)
+        else:
+            self.lineNumberArea.update(0, rect.y(), self.lineNumberArea.width(), rect.height())
+
+        if rect.contains(self.viewport().rect()):
+            self.updateLineNumberAreaWidth(0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        cr = self.contentsRect()
+        self.lineNumberArea.setGeometry(QRect(cr.left(), cr.top(), self.lineNumberAreaWidth(), cr.height()))
+
+    def lineNumberAreaPaintEvent(self, event):
+        painter = QPainter(self.lineNumberArea)
+        painter.fillRect(event.rect(), QColor("#22232e")) # Line number background
+
+        block = self.firstVisibleBlock()
+        blockNumber = block.blockNumber()
+        top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
+        bottom = top + self.blockBoundingRect(block).height()
+
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                number = str(blockNumber + 1)
+                painter.setPen(QColor("#545c7e")) # Line number color
+                painter.drawText(0, int(top), self.lineNumberArea.width(), self.fontMetrics().height(),
+                                 Qt.AlignmentFlag.AlignRight, number)
+
+            block = block.next()
+            top = bottom
+            bottom = top + self.blockBoundingRect(block).height()
+            blockNumber += 1
+
     def load_file(self, file_path: str):
         """Load content from a file."""
         import os
@@ -108,56 +235,78 @@ class EditorArea(QWidget):
     """
     
     # Signals
-    file_saved = pyqtSignal(str)  # Emits file path
-    tab_changed = pyqtSignal(int)  # Emits tab index
-    editor_status_changed = pyqtSignal(bool)  # Emits has_modified_files
+    file_saved = pyqtSignal(str)
+    tab_changed = pyqtSignal(int)
+    editor_status_changed = pyqtSignal(bool)
     
     def __init__(self, parent=None):
         super().__init__(parent)
         self._setup_ui()
-    
+        self.installEventFilter(self)
+
+    def eventFilter(self, source, event):
+        if (event.type() == QEvent.Type.KeyPress and
+                event.key() == Qt.Key.Key_F and
+                event.modifiers() == Qt.KeyboardModifier.ControlModifier):
+            self.toggle_search_bar()
+            return True
+        return super().eventFilter(source, event)
+
     def _setup_ui(self):
         """Initialize the editor area UI."""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         
-        # Welcome tab (default)
+        self.search_bar = SearchBar(self)
+        self.search_bar.hide()
+        self.search_bar.search_requested.connect(self.on_search_requested)
+        layout.addWidget(self.search_bar)
+        
         self.welcome_widget = self._create_welcome_tab()
         
-        # Tab widget
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.tabCloseRequested.connect(self._on_tab_close)
         self.tabs.currentChanged.connect(self._on_current_changed)
         
-        # Add welcome tab initially
-        self.tabs.addTab(self.welcome_widget, "Welcome")
+        self.tabs.setStyleSheet("""
+            QTabBar::tab:!selected {
+                border-right: 1px solid #2a2b37;
+            }
+        """)
         
+        self.tabs.addTab(self.welcome_widget, "Welcome")
         layout.addWidget(self.tabs)
     
     def _create_welcome_tab(self) -> QWidget:
-        """Create the welcome screen widget."""
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
         title = QLabel("🚀 Welcome to LumeIDE")
         title.setStyleSheet("font-size: 24px; font-weight: bold; color: #4EC9B0;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
-        
         subtitle = QLabel("Open a folder to get started")
         subtitle.setStyleSheet("color: #888; padding: 10px;")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(subtitle)
-        
         return widget
-    
+
+    def toggle_search_bar(self):
+        if self.search_bar.isVisible():
+            self.search_bar.hide()
+        else:
+            self.search_bar.show()
+            self.search_bar.search_input.setFocus()
+
+    def on_search_requested(self, text, forward):
+        editor = self.get_current_editor()
+        if editor:
+            editor.search(text, forward)
+
     def _on_tab_close(self, index: int):
-        """Handle tab close request."""
-        # Don't close the welcome tab
         if index == 0 and self.tabs.widget(0) == self.welcome_widget:
             return
         
@@ -175,101 +324,87 @@ class EditorArea(QWidget):
         self._check_modified_state()
     
     def _on_current_changed(self, index: int):
-        """Handle tab change."""
         if index >= 0:
             self.tab_changed.emit(index)
             self._check_modified_state()
     
     def _check_modified_state(self):
-        """Check if any tabs have modified content."""
         has_modified = False
         for i in range(self.tabs.count()):
             widget = self.tabs.widget(i)
             if isinstance(widget, CodeEditor) and widget.is_modified():
                 has_modified = True
                 break
-        
         self.editor_status_changed.emit(has_modified)
     
     def open_file(self, file_path: str) -> bool:
-        """Open a file in a new tab or switch to existing."""
         import os
         normalized = os.path.normpath(file_path)
         
-        # Check if already open
         for i in range(self.tabs.count()):
             widget = self.tabs.widget(i)
             if isinstance(widget, CodeEditor) and widget.file_path == normalized:
                 self.tabs.setCurrentIndex(i)
                 return True
         
-        # Create new editor
         editor = CodeEditor(normalized)
-        success = editor.load_file(normalized)
-        
-        if not success:
+        if not editor.load_file(normalized):
             return False
         
-        # Add tab
         file_name = editor.get_file_name()
         index = self.tabs.addTab(editor, file_name)
         self.tabs.setCurrentIndex(index)
         
+        if self.tabs.widget(0) == self.welcome_widget:
+            self.tabs.removeTab(0)
+
         return True
     
     def save_current(self) -> bool:
-        """Save the current tab."""
         widget = self.tabs.currentWidget()
         if isinstance(widget, CodeEditor):
             success, error = widget.save_file()
             if success:
                 self.file_saved.emit(widget.file_path)
-                # Update tab title
                 index = self.tabs.currentIndex()
                 self.tabs.setTabText(index, widget.get_file_name())
             return success
         return False
     
     def save_all(self) -> int:
-        """Save all modified tabs. Returns count of saved files."""
         saved_count = 0
         for i in range(self.tabs.count()):
             widget = self.tabs.widget(i)
             if isinstance(widget, CodeEditor) and widget.is_modified():
-                success, _ = widget.save_file()
-                if success:
+                if widget.save_file()[0]:
                     saved_count += 1
                     self.tabs.setTabText(i, widget.get_file_name())
                     self.file_saved.emit(widget.file_path)
         return saved_count
     
     def get_current_editor(self) -> CodeEditor:
-        """Get the current editor widget."""
         widget = self.tabs.currentWidget()
-        if isinstance(widget, CodeEditor):
-            return widget
-        return None
+        return widget if isinstance(widget, CodeEditor) else None
     
     def get_current_file(self) -> str:
-        """Get the current file path."""
         editor = self.get_current_editor()
         return editor.file_path if editor else None
     
     def close_all_tabs(self, force: bool = False) -> bool:
-        """Close all tabs. Returns True if successful."""
+        can_close = True
         if not force:
             for i in range(self.tabs.count() - 1, -1, -1):
-                if i == 0 and self.tabs.widget(0) == self.welcome_widget:
-                    continue
                 self._on_tab_close(i)
-        else:
-            # Remove all non-welcome tabs
+                if self.tabs.count() > 1 and i > 0: # check if tab is still there
+                     can_close = False
+        
+        if can_close:
             while self.tabs.count() > 1:
                 self.tabs.removeTab(1)
-        return True
+        
+        return can_close
     
     def has_modified_files(self) -> bool:
-        """Check if any tabs have unsaved changes."""
         for i in range(self.tabs.count()):
             widget = self.tabs.widget(i)
             if isinstance(widget, CodeEditor) and widget.is_modified():
@@ -277,7 +412,6 @@ class EditorArea(QWidget):
         return False
     
     def get_open_files(self) -> list:
-        """Get list of open file paths."""
         files = []
         for i in range(self.tabs.count()):
             widget = self.tabs.widget(i)

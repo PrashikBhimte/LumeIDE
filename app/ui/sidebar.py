@@ -45,6 +45,7 @@ class FileExplorer(QWidget):
         # Tree view
         self.tree_view = QTreeView()
         self.tree_view.setHeaderHidden(True)
+        self.tree_view.setAnimated(True) # Enable animations
         self.tree_view.doubleClicked.connect(self._on_double_click)
         self.tree_view.clicked.connect(self._on_click)
         
@@ -52,6 +53,11 @@ class FileExplorer(QWidget):
         self.model = QFileSystemModel()
         self.model.setRootPath('')
         self.tree_view.setModel(self.model)
+
+        # Hide columns for Size, Type, Date Modified
+        self.tree_view.setColumnHidden(1, True)
+        self.tree_view.setColumnHidden(2, True)
+        self.tree_view.setColumnHidden(3, True)
         
         layout.addWidget(self.tree_view)
     

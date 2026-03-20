@@ -3,3 +3,4 @@ PyQt6-WebEngine
 google-genai
 python-dotenv
 aiosqlite
+mistune

@@ -3,11 +3,16 @@ Aura Client Module for LumeIDE
 
 Client for interacting with Google's Gemini models using the google-genai SDK.
 Handles AI-powered code generation and tool execution.
+
+Logging:
+    All operations are logged to stdout for debugging.
+    Use THOUGHT logs to see AI reasoning before tool execution.
 """
 
 import os
+import json
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Optional, List, Dict, Any, Callable
 
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
@@ -17,7 +22,50 @@ from google import genai
 from google.genai import types
 
 from app.engine.tools import TOOL_FUNCTIONS
+from app.engine.utils.tool_utils import build_all_tool_declarations # <--- NEW IMPORT
 
+
+# ============================================================================
+# LOGGING UTILITIES
+# ============================================================================
+
+def log_header(title: str):
+    """Print a formatted log header."""
+    print(f"\n{'='*70}")
+    print(f" {title}")
+    print(f"{'='*70}")
+
+def log_thought(tool_name: str, args: Dict[str, Any]):
+    """Print the AI's thought process before tool execution."""
+    print(f"\n[🤔 AI THOUGHT] I am going to call {tool_name} with:")
+    for key, value in args.items():
+        # Truncate long values for display
+        value_str = str(value)
+        if len(value_str) > 100:
+            value_str = value_str[:100] + "..."
+        print(f"    {key}: {value_str}")
+
+def log_tool_execution(tool_name: str, result: str):
+    """Print the result of tool execution."""
+    # Truncate long results
+    result_preview = result[:500] if len(result) > 500 else result
+    print(f"\n[🔧 TOOL RESULT] {tool_name}:")
+    print(f"    {result_preview}")
+    if len(result) > 500:
+        print(f"    ... (truncated, full result: {len(result)} chars)")
+
+def log_error(tool_name: str, error: str):
+    """Print an error during tool execution."""
+    print(f"\n[❌ TOOL ERROR] {tool_name}: {error}")
+
+def log_iteration(iteration: int, total: int, tool_name: str):
+    """Print iteration progress."""
+    print(f"\n[📍 ITERATION {iteration}/{total}] Processing tool: {tool_name}")
+
+
+# ============================================================================
+# DATA CLASSES
+# ============================================================================
 
 @dataclass
 class GenerationResult:
@@ -27,6 +75,20 @@ class GenerationResult:
     prompt_feedback: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
 
+
+@dataclass
+class ToolCall:
+    """Represents a tool call with its arguments."""
+    name: str
+    args: Dict[str, Any]
+    
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+
+# ============================================================================
+# WORKER THREAD
+# ============================================================================
 
 class AuraWorker(QObject):
     """Worker thread for async generation."""
@@ -48,6 +110,10 @@ class AuraWorker(QObject):
         self.finished.emit(result)
 
 
+# ============================================================================
+# MAIN AURA CLIENT
+# ============================================================================
+
 class AuraClient(QObject):
     """
     A client for interacting with Google's Gemini models.
@@ -55,6 +121,10 @@ class AuraClient(QObject):
     
     Supports tool calling for file operations and provides
     signals for UI updates during generation.
+    
+    Logging:
+        All operations print to stdout for debugging.
+        Thought Logger shows AI reasoning before tool execution.
     """
     
     # Signals for UI updates
@@ -62,7 +132,7 @@ class AuraClient(QObject):
     tool_used = pyqtSignal(str, dict)
     finished = pyqtSignal(object)
     
-    def __init__(self, api_key: str = None, model_name: str = "gemini-2.0-flash"):
+    def __init__(self, api_key: str = None, model_name: str = "gemini-2.5-flash"):
         super().__init__()
         
         # Get API key from argument or environment
@@ -91,6 +161,7 @@ class AuraClient(QObject):
         self.thread = None
         self.worker = None
         self._is_streaming = False
+        self._verbose = True  # Enable verbose logging
         
         # Initialize the client
         self._initialize_client()
@@ -99,10 +170,14 @@ class AuraClient(QObject):
         """Initialize the Gemini client using google-genai SDK."""
         try:
             self.client = genai.Client(api_key=self.api_key)
-            print(f"AuraClient initialized with model: {self.model_name}")
+            print(f"[✓] AuraClient initialized with model: {self.model_name}")
         except Exception as e:
-            print(f"Error initializing Gemini client: {e}")
+            print(f"[✗] Error initializing Gemini client: {e}")
             raise
+
+    def set_verbose(self, verbose: bool):
+        """Enable or disable verbose logging."""
+        self._verbose = verbose
 
     def generate_response(
         self,
@@ -151,7 +226,16 @@ class AuraClient(QObject):
         
         Returns:
             GenerationResult with response text or error
+        
+        Logging:
+            Prints detailed logs of AI thoughts and tool execution.
         """
+        log_header("AURA GENERATION START")
+        print(f"[📝 PROMPT]: {prompt_text[:200]}{'...' if len(prompt_text) > 200 else ''}")
+        if system_instruction:
+            print(f"[📋 SYSTEM INSTRUCTION]: {len(system_instruction)} chars")
+        print()
+        
         try:
             # Use built-in tools if none provided
             if tools is None:
@@ -174,17 +258,23 @@ class AuraClient(QObject):
             )
 
             # Create chat session
+            print("[💬] Creating chat session...")
             chat = self.client.chats.create(
                 model=self.model_name,
                 config=config
             )
             
             # Send initial prompt
+            print("[📤] Sending initial prompt to Gemini...")
             response = chat.send_message(prompt_text)
+            
+            print(f"[📥] Received response with {len(response.function_calls) if response.function_calls else 0} function calls")
+            print()
 
             # Handle function calls in a loop
             max_iterations = 10  # Prevent infinite loops
             iteration = 0
+            total_tool_calls = []
             
             while response.function_calls and iteration < max_iterations:
                 iteration += 1
@@ -194,6 +284,21 @@ class AuraClient(QObject):
                 tool_name = function_call.name
                 tool_args = dict(function_call.args) if function_call.args else {}
                 
+                # Log iteration
+                log_iteration(iteration, max_iterations, tool_name)
+                
+                # Store tool call for history
+                tool_call_record = ToolCall(name=tool_name, args=tool_args)
+                total_tool_calls.append(tool_call_record)
+                
+                # THOUGHT LOGGER: Show AI reasoning before execution
+                log_thought(tool_name, tool_args)
+                
+                # Print raw JSON of the function call
+                if self._verbose:
+                    print(f"\n[📄 RAW FUNCTION CALL JSON]:")
+                    print(json.dumps(tool_call_record.to_dict(), indent=2))
+                
                 # Emit signal for UI to show tool usage
                 self.tool_used.emit(tool_name, tool_args)
 
@@ -201,20 +306,30 @@ class AuraClient(QObject):
                 if tool_name in self.tool_functions:
                     tool_function = self.tool_functions[tool_name]
                     try:
+                        print(f"\n[⚙️  EXECUTING] Calling {tool_function.__name__}...")
+                        
                         # Execute the tool function
                         tool_result = tool_function(**tool_args)
                         
+                        # Log successful execution
+                        log_tool_execution(tool_name, tool_result)
+                        
                         # Send result back to the model
+                        print(f"\n[📤] Sending tool result back to Gemini...")
                         response = chat.send_message(
                             types.Part.from_function_response(
                                 name=tool_name,
                                 response={"result": str(tool_result)}
                             )
                         )
+                        
+                        print(f"[📥] Next response: {len(response.function_calls) if response.function_calls else 0} function calls remaining")
+                        
                     except TypeError as e:
                         # Handle wrong arguments passed to tool
                         error_msg = f"Tool '{tool_name}' received invalid arguments: {tool_args}. Error: {str(e)}"
-                        print(f"Tool error: {error_msg}")
+                        log_error(tool_name, error_msg)
+                        print(f"\n[📤] Sending error back to Gemini...")
                         response = chat.send_message(
                             types.Part.from_function_response(
                                 name=tool_name,
@@ -224,7 +339,8 @@ class AuraClient(QObject):
                     except Exception as e:
                         # Catch any other tool execution errors
                         error_msg = f"Error executing tool '{tool_name}': {str(e)}"
-                        print(f"Tool error: {error_msg}")
+                        log_error(tool_name, error_msg)
+                        print(f"\n[📤] Sending error back to Gemini...")
                         response = chat.send_message(
                             types.Part.from_function_response(
                                 name=tool_name,
@@ -233,8 +349,9 @@ class AuraClient(QObject):
                         )
                 else:
                     # Unknown tool - report back to model
-                    print(f"Warning: Unknown tool requested: '{tool_name}'")
                     error_msg = f"Unknown tool: '{tool_name}'. Available tools: {list(self.tool_functions.keys())}"
+                    print(f"\n[⚠️  UNKNOWN TOOL] {error_msg}")
+                    print(f"[📤] Sending error back to Gemini...")
                     response = chat.send_message(
                         types.Part.from_function_response(
                             name=tool_name,
@@ -242,9 +359,27 @@ class AuraClient(QObject):
                         )
                     )
                     break  # Exit loop on unknown tool
+                
+                print()
             
             if iteration >= max_iterations:
-                print("Warning: Maximum tool call iterations reached")
+                print(f"[⚠️  WARNING] Maximum tool call iterations ({max_iterations}) reached")
+            
+            # Log final response
+            log_header("AURA GENERATION COMPLETE")
+            print(f"[📊 SUMMARY]:")
+            print(f"    - Total iterations: {iteration}")
+            print(f"    - Total tool calls: {len(total_tool_calls)}")
+            for tc in total_tool_calls:
+                print(f"      • {tc.name}({list(tc.args.keys())})")
+            print(f"\n[💬 FINAL RESPONSE]:")
+            print("-" * 70)
+            final_text = response.text if hasattr(response, 'text') else None
+            if final_text:
+                print(final_text)
+            else:
+                print("(No text response)")
+            print("-" * 70)
 
             return GenerationResult(
                 text=response.text if hasattr(response, 'text') else None,
@@ -254,7 +389,10 @@ class AuraClient(QObject):
 
         except Exception as e:
             error_msg = str(e)
-            print(f"Error generating content: {error_msg}")
+            log_header("AURA GENERATION ERROR")
+            print(f"[❌ ERROR]: {error_msg}")
+            import traceback
+            traceback.print_exc()
             return GenerationResult(text=None, error=error_msg)
 
     def _build_function_declarations(self) -> List[Dict]:
@@ -262,68 +400,8 @@ class AuraClient(QObject):
         Build function declarations for the Gemini API.
         These define the tool schema that the model uses.
         """
-        return [
-            {
-                "name": "read_file",
-                "description": "Read the complete content of a file from the filesystem. Use this when you need to see the contents of a file to understand, debug, or modify it.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The absolute or relative path to the file to read"
-                        }
-                    },
-                    "required": ["path"]
-                }
-            },
-            {
-                "name": "write_file",
-                "description": "Create or overwrite a file with the specified content. Use this to write or modify code files, configuration files, or any text-based files.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The path where the file should be created or overwritten"
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "The complete content to write to the file"
-                        }
-                    },
-                    "required": ["path", "content"]
-                }
-            },
-            {
-                "name": "create_directory",
-                "description": "Create a new directory (folder) at the specified path. Creates parent directories as needed.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The path where the directory should be created"
-                        }
-                    },
-                    "required": ["path"]
-                }
-            },
-            {
-                "name": "list_directory",
-                "description": "List the contents of a directory showing files and subdirectories.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The path to the directory to list"
-                        }
-                    },
-                    "required": ["path"]
-                }
-            }
-        ]
+        # Dynamically build function declarations from TOOL_FUNCTIONS
+        return build_all_tool_declarations(self.tool_functions) # <--- MODIFIED LINE
 
     def abort(self):
         """
@@ -332,12 +410,14 @@ class AuraClient(QObject):
         if self._is_streaming:
             self._abort_event.set()
             self._is_streaming = False
-            print("Aura generation abort requested")
+            print("[⏹️  ABORT] Aura generation abort requested")
 
     def is_generating(self) -> bool:
-        """Check if a generation is currently in progress."""
+        """
+        Check if a generation is currently in progress.
+        """
         return self._is_streaming
 
 
 # Export for easy importing
-__all__ = ['AuraClient', 'GenerationResult']
+__all__ = ['AuraClient', 'GenerationResult', 'ToolCall', 'log_header', 'log_thought', 'log_tool_execution', 'log_error']

@@ -1,9 +1,11 @@
 import sys
+from dotenv import load_dotenv
 from PyQt6.QtWidgets import QApplication
 
 from app.ui.main_window import MainWindow
 from app.ui.styles import DARK_PLUS_QSS
 
+load_dotenv()
 
 def main():
     """

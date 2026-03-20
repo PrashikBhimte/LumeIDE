@@ -6,6 +6,7 @@ class ProjectContext:
     """
     Holds the context for the current project.
     """
+    root_path: Optional[str] = None
     description: Optional[str] = None
     tech_stack: Optional[str] = "Python/AI"
     venv_path: Optional[str] = None

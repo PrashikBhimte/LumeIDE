@@ -1,31 +1,39 @@
 """
 Bottom Panel Module for LumeIDE
 
-Provides the Terminal and Log Viewer panels.
+Provides the Unified Shell and Log Viewer panels.
 """
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit,
-    QTabWidget, QPushButton, QLabel, QComboBox
+    QTabWidget, QPushButton, QLabel, QComboBox, QLineEdit
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont
 
+from app.engine.dispatcher import CommandDispatcher
 
-class TerminalOutput(QTextEdit):
+
+class UnifiedShell(QWidget):
     """
-    Terminal output widget with command history.
+    A unified shell for both commands and natural language queries.
     """
-    
-    def __init__(self, parent=None):
+
+    def __init__(self, command_dispatcher: CommandDispatcher, parent=None):
         super().__init__(parent)
+        self.command_dispatcher = command_dispatcher
         self._setup_ui()
-    
+
     def _setup_ui(self):
-        """Initialize the terminal UI."""
-        self.setFont(QFont("Consolas", 10))
-        self.setReadOnly(True)
-        self.setStyleSheet("""
+        """Initialize the unified shell UI."""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.output_view = QTextEdit()
+        self.output_view.setFont(QFont("Consolas", 10))
+        self.output_view.setReadOnly(True)
+        self.output_view.setStyleSheet("""
             QTextEdit {
                 background-color: #1E1E1E;
                 color: #D4D4D4;
@@ -33,29 +41,58 @@ class TerminalOutput(QTextEdit):
                 padding: 8px;
             }
         """)
-    
+
+        self.input_line = QLineEdit()
+        self.input_line.setFont(QFont("Consolas", 10))
+        self.input_line.setStyleSheet("""
+            QLineEdit {
+                background-color: #252526;
+                color: #D4D4D4;
+                border: 1px solid #333;
+                padding: 4px 8px;
+            }
+        """)
+        self.input_line.setPlaceholderText("Enter a command or ask Aura...")
+        self.input_line.returnPressed.connect(self._on_command_entered)
+        
+        layout.addWidget(self.output_view)
+        layout.addWidget(self.input_line)
+
+    def _on_command_entered(self):
+        """Handle command entry."""
+        command = self.input_line.text()
+        if not command:
+            return
+
+        self.input_line.clear()
+        self.append_output(f"> {command}", "gray")
+
+        output, color = self.command_dispatcher.dispatch(command)
+        self.append_output(output, color)
+
     def append_output(self, text: str, color: str = None):
-        """Append text to terminal with optional color."""
-        if color:
-            self.append(f'<span style="color: {color};">{text}</span>')
+        """Append text to the output view with optional color."""
+        color_map = {
+            "green": "#4EC9B0",  # Terminal output
+            "blue": "#569CD6",   # Aura response
+            "red": "#F14C4C",    # Errors
+            "gray": "#888888"    # Command echo
+        }
+        
+        if color and color.startswith("#"):
+            hex_color = color
         else:
-            self.append(text)
-    
-    def append_command(self, command: str):
-        """Append a command with prompt."""
-        self.append(f'<span style="color: #4EC9B0;">$ {command}</span>')
-    
-    def append_error(self, error: str):
-        """Append an error message."""
-        self.append(f'<span style="color: #F14C4C;">Error: {error}</span>')
-    
-    def append_success(self, text: str):
-        """Append a success message."""
-        self.append(f'<span style="color: #4EC9B0;">{text}</span>')
-    
+            hex_color = color_map.get(color, "#D4D4D4") # Default to standard text color
+        
+        # Pre-wrap to avoid long lines
+        formatted_text = f'<pre style="white-space: pre-wrap; margin: 0; font-family: Consolas, monospace;">{text}</pre>'
+
+        self.output_view.append(f'<div style="color: {hex_color};">{formatted_text}</div>')
+        self.output_view.verticalScrollBar().setValue(self.output_view.verticalScrollBar().maximum())
+
     def clear_output(self):
-        """Clear terminal output."""
-        self.clear()
+        """Clear the output view."""
+        self.output_view.clear()
 
 
 class LogViewer(QTextEdit):
@@ -158,14 +195,15 @@ class LogViewer(QTextEdit):
 
 class BottomPanel(QWidget):
     """
-    Bottom panel containing Terminal and Log Viewer tabs.
+    Bottom panel containing Unified Shell and Log Viewer tabs.
     """
     
     # Signals
     command_executed = pyqtSignal(str)  # Emits command
     
-    def __init__(self, parent=None):
+    def __init__(self, command_dispatcher: CommandDispatcher, parent=None):
         super().__init__(parent)
+        self.command_dispatcher = command_dispatcher
         self._setup_ui()
     
     def _setup_ui(self):
@@ -195,45 +233,25 @@ class BottomPanel(QWidget):
             }
         """)
         
-        # Terminal tab
-        self.terminal = TerminalOutput()
-        terminal_container = QWidget()
-        terminal_layout = QVBoxLayout(terminal_container)
-        terminal_layout.setContentsMargins(0, 0, 0, 0)
-        terminal_layout.addWidget(self.terminal)
+        # Unified Shell tab
+        self.shell = UnifiedShell(self.command_dispatcher)
         
         # Log Viewer tab
         self.log_viewer = LogViewer()
-        log_container = QWidget()
-        log_layout = QVBoxLayout(log_container)
-        log_layout.setContentsMargins(0, 0, 0, 0)
-        log_layout.addWidget(self.log_viewer)
         
         # Add tabs
-        self.tabs.addTab(terminal_container, "Terminal")
-        self.tabs.addTab(log_container, "Log Viewer")
+        self.tabs.addTab(self.shell, "Unified Shell")
+        self.tabs.addTab(self.log_viewer, "Log Viewer")
         
         layout.addWidget(self.tabs)
     
-    def append_terminal_output(self, text: str, color: str = None):
-        """Append output to terminal."""
-        self.terminal.append_output(text, color)
+    def append_output(self, text: str, color: str = None):
+        """Append output to the shell."""
+        self.shell.append_output(text, color)
     
-    def append_command(self, command: str):
-        """Append a command to terminal."""
-        self.terminal.append_command(command)
-    
-    def append_error(self, error: str):
-        """Append an error to terminal."""
-        self.terminal.append_error(error)
-    
-    def append_success(self, text: str):
-        """Append success message to terminal."""
-        self.terminal.append_success(text)
-    
-    def clear_terminal(self):
-        """Clear terminal output."""
-        self.terminal.clear_output()
+    def clear_shell(self):
+        """Clear shell output."""
+        self.shell.clear_output()
     
     def log_request(self, data: dict):
         """Log a request to Log Viewer."""
@@ -253,8 +271,8 @@ class BottomPanel(QWidget):
         """Clear log viewer."""
         self.log_viewer.clear_logs()
     
-    def show_terminal(self):
-        """Show the terminal tab."""
+    def show_shell(self):
+        """Show the shell tab."""
         self.tabs.setCurrentIndex(0)
     
     def show_log_viewer(self):
@@ -263,4 +281,4 @@ class BottomPanel(QWidget):
 
 
 # Export
-__all__ = ['BottomPanel', 'TerminalOutput', 'LogViewer']
+__all__ = ['BottomPanel', 'UnifiedShell', 'LogViewer']

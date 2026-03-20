@@ -1,9 +1,9 @@
 # LumeIDE UI Package
 # Components
 from app.ui.activity_bar import ActivityBar, LedIndicator
-from app.ui.sidebar import Sidebar, FileExplorer, AuraChat
+from app.ui.sidebar import Sidebar, FileExplorer
 from app.ui.editor_area import EditorArea, CodeEditor
-from app.ui.bottom_panel import BottomPanel, TerminalOutput, LogViewer
+from app.ui.bottom_panel import BottomPanel, LogViewer
 from app.ui.main_window import MainWindow
 
 # Dialogs

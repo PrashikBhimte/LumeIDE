@@ -59,7 +59,7 @@ class AuraClient:
     Supports streaming responses and abort mechanism.
     """
 
-    def __init__(self, api_key: str = None, model_name: str = "gemini-2.0-flash"):
+    def __init__(self, api_key: str = None, model_name: str = "gemini-2.5-flash"):
         """
         Initializes the AuraClient.
 

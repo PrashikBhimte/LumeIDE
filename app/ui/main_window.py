@@ -3,9 +3,9 @@ Main Window Module for LumeIDE
 
 Orchestrator that assembles all UI components:
 - Activity Bar (left icon navigation)
-- Sidebar (Explorer + Aura Chat)
+- Sidebar (Explorer)
 - Editor Area (tabbed code editor)
-- Bottom Panel (Terminal + Log Viewer)
+- Bottom Panel (Unified Shell + Log Viewer)
 
 Manages the overall layout and coordinates between components.
 """
@@ -29,8 +29,8 @@ from app.ui.bottom_panel import BottomPanel
 
 # Import core modules
 from app.storage.database import ChronicleDB
-from app.engine.tool_dispatcher import TaskDispatcher
-from app.engine.error_recovery import ErrorRecovery
+from app.engine.dispatcher import CommandDispatcher
+from app.models.project_context import ProjectContext
 from app.engine.aura_client import AuraClient, VaultToolset
 from app.utils.venv_detector import VenvDetector
 from app.ui.onboarding import ProjectOnboardingDialog
@@ -50,6 +50,7 @@ class MainWindow(QMainWindow):
         self.current_project_path = None
         self.current_project_id = None
         self._project_opened = False
+        self.project_context = ProjectContext()
 
         # Initialize core modules
         self._init_core_modules()
@@ -71,18 +72,22 @@ class MainWindow(QMainWindow):
         self.db = ChronicleDB('lume_ide.db')
         self.db.connect()
         self.db.create_tables()
-        self.db.create_tasks_table_migration()
-        self.db.create_ui_state_table()
 
         # Engine components
-        self.task_dispatcher = TaskDispatcher()
-        self.error_recovery = ErrorRecovery(task_dispatcher=self.task_dispatcher)
         self.venv_detector = VenvDetector()
         self.vault_tools = VaultToolset()
+        self.editor_area = EditorArea() # Editor area needs to be created before dispatcher
 
         # Try to initialize Aura client (may fail if no API key)
         self.aura_client = None
         self._init_aura_client()
+
+        # Command Dispatcher
+        self.command_dispatcher = CommandDispatcher(
+            project_context=self.project_context,
+            aura_client=self.aura_client,
+            editor_area=self.editor_area,
+        )
 
     def _init_aura_client(self):
         """Initialize Aura client."""
@@ -109,14 +114,13 @@ class MainWindow(QMainWindow):
         # Horizontal splitter for sidebar and editor
         horizontal_splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Sidebar (Explorer + Aura Chat)
+        # Sidebar (Explorer)
         self.sidebar = Sidebar()
         self.sidebar.setMinimumWidth(200)
         self.sidebar.setMaximumWidth(400)
         horizontal_splitter.addWidget(self.sidebar)
 
         # Editor area (tabbed code editor)
-        self.editor_area = EditorArea()
         horizontal_splitter.addWidget(self.editor_area)
 
         # Set initial sizes
@@ -125,9 +129,9 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(horizontal_splitter, stretch=1)
 
-        # Bottom panel (Terminal + Log Viewer)
-        self.bottom_panel = BottomPanel()
-        self.bottom_panel.setMinimumHeight(100)
+        # Bottom panel (Unified Shell + Log Viewer)
+        self.bottom_panel = BottomPanel(command_dispatcher=self.command_dispatcher)
+        self.bottom_panel.setMinimumHeight(150)
         self.bottom_panel.setMaximumHeight(400)
 
         # Create dock for bottom panel
@@ -246,7 +250,7 @@ class MainWindow(QMainWindow):
         # Run
         run_action = QAction("▶️", self)
         run_action.setToolTip("Run Python File")
-        run_action.triggered.connect(self._run_current_file)
+        run_action.triggered.connect(lambda: self.command_dispatcher.dispatch("run this"))
         toolbar.addAction(run_action)
 
         # Stop
@@ -262,8 +266,6 @@ class MainWindow(QMainWindow):
 
         # Sidebar -> File operations
         self.sidebar.file_double_clicked.connect(self.editor_area.open_file)
-        self.sidebar.message_sent.connect(self._on_aura_message)
-        self.sidebar.aura_stopped.connect(self._on_aura_stopped)
 
         # Editor area
         self.editor_area.file_saved.connect(self._on_file_saved)
@@ -272,50 +274,13 @@ class MainWindow(QMainWindow):
     def _on_view_changed(self, view_id: str):
         """Handle activity bar view changes."""
         if view_id == 'explorer':
-            self.sidebar.tab_selector.setCurrentIndex(0)
-        elif view_id == 'aura':
-            self.sidebar.tab_selector.setCurrentIndex(1)
+            self.sidebar.show_explorer()
         elif view_id == 'settings':
             self._show_project_settings()
 
-    def _on_aura_message(self, message: str):
-        """Handle Aura chat message."""
-        if not self.aura_client:
-            self.sidebar.add_error("Aura is not configured. Set GEMINI_API_KEY environment variable.")
-            return
-
-        self.activity_bar.set_ai_active(True)
-        self.bottom_panel.append_command(f"Send to Aura: {message}")
-
-        # Create task
-        task_id = self.db.create_task(self.current_project_id, message, "processing")
-
-        # Send to Aura (async - in production would use threading)
-        try:
-            result = self.aura_client.send_prompt(message, stream=False)
-            if result.error:
-                self.sidebar.add_error(result.error)
-                self.db.update_task_error(task_id, result.error)
-            else:
-                self.sidebar.add_response(result.text or "No response")
-                self.db.update_task_result(task_id, result.text)
-        except Exception as e:
-            error_msg = str(e)
-            self.sidebar.add_error(error_msg)
-            self.db.update_task_error(task_id, error_msg)
-
-        self.activity_bar.set_ai_active(False)
-
-    def _on_aura_stopped(self):
-        """Handle Aura stop request."""
-        if self.aura_client:
-            self.aura_client.abort()
-        self.activity_bar.set_ai_active(False)
-
     def _on_file_saved(self, file_path: str):
         """Handle file saved event."""
-        import os
-        self.bottom_panel.append_success(f"Saved: {os.path.basename(file_path)}")
+        self.bottom_panel.append_output(f"Saved: {os.path.basename(file_path)}", "green")
 
     def _on_tab_changed(self, index: int):
         """Handle tab change."""
@@ -329,16 +294,11 @@ class MainWindow(QMainWindow):
 
         normalized = os.path.normpath(path)
         self.current_project_path = normalized
+        self.project_context.root_path = normalized
 
         # Register project
         project_name = os.path.basename(normalized)
         self.current_project_id = self.db.register_project(project_name, normalized)
-
-        # Setup task dispatcher
-        self.task_dispatcher.set_working_directory(normalized)
-
-        # Setup vault tools
-        self.vault_tools.working_dir = normalized
 
         # Update sidebar
         self.sidebar.set_root_path(normalized)
@@ -365,11 +325,13 @@ class MainWindow(QMainWindow):
         venv_info = self.venv_detector.find_venv_in_directory(self.current_project_path)
         if venv_info:
             normalized_venv = os.path.normpath(venv_info['path'])
+            self.project_context.venv_path = normalized_venv
             self.venv_label.setText(f"venv: {venv_info['name']}")
-            self.bottom_panel.append_terminal_output(
-                f"Detected: {normalized_venv}", "#4EC9B0"
+            self.bottom_panel.append_output(
+                f"Detected venv: {normalized_venv}", "green"
             )
         else:
+            self.project_context.venv_path = None
             self.venv_label.setText("No venv detected")
 
     def _show_onboarding(self, path: str, name: str):
@@ -380,62 +342,22 @@ class MainWindow(QMainWindow):
 
     def _on_project_configured(self, config: dict):
         """Handle project configuration."""
-        self.bottom_panel.append_terminal_output(
-            f"Project configured: {config['project_name']}", "#4EC9B0"
+        self.bottom_panel.append_output(
+            f"Project configured: {config['project_name']}", "green"
         )
 
         # Install packages if specified
         packages = config.get('packages', [])
         if packages:
-            self._install_packages(packages)
-
-    def _install_packages(self, packages: list):
-        """Install packages via pip."""
-        self.bottom_panel.append_command(f"pip install {' '.join(packages)}")
-
-        for package in packages:
-            try:
-                from app.engine.tool_dispatcher import tool_run_command
-                result = tool_run_command(
-                    f"pip install {package}",
-                    cwd=self.current_project_path
-                )
-                self.bottom_panel.append_terminal_output(result)
-            except Exception as e:
-                self.bottom_panel.append_error(str(e))
-
-    def _run_current_file(self):
-        """Run the current Python file."""
-        file_path = self.editor_area.get_current_file()
-        if not file_path:
-            return
-
-        if not file_path.endswith('.py'):
-            self.bottom_panel.append_error("Not a Python file")
-            return
-
-        self.bottom_panel.append_command(f"python {file_path}")
-
-        # Get venv python if available
-        venv_info = self.venv_detector.find_venv_in_directory(self.current_project_path)
-        if venv_info and venv_info.get('python_path'):
-            python_path = os.path.normpath(venv_info['python_path'])
-            cmd = f'"{python_path}" "{os.path.normpath(file_path)}"'
-        else:
-            cmd = f'python "{os.path.normpath(file_path)}"'
-
-        try:
-            from app.engine.tool_dispatcher import tool_run_command
-            result = tool_run_command(cmd, cwd=self.current_project_path, timeout=60)
-            self.bottom_panel.append_terminal_output(result)
-        except Exception as e:
-            self.bottom_panel.append_error(str(e))
+            command = f"pip install {' '.join(packages)}"
+            self.command_dispatcher.dispatch(command)
 
     def _stop_execution(self):
         """Stop current execution."""
+        # This might need to be re-wired to the dispatcher if it handles long-running processes
         if self.aura_client and self.aura_client.is_generating():
             self.aura_client.abort()
-            self.bottom_panel.append_terminal_output("Execution stopped", "#F14C4C")
+            self.bottom_panel.append_output("Aura generation stopped.", "red")
 
     def _show_project_settings(self):
         """Show project settings."""
@@ -452,14 +374,7 @@ class MainWindow(QMainWindow):
             self,
             "About LumeIDE",
             "LumeIDE\n\n"
-            "A modern Python IDE with AI-powered assistance.\n\n"
-            "Features:\n"
-            "• AI Code Generation with Gemini\n"
-            "• Virtual Environment Detection\n"
-            "• Diff Preview for Code Changes\n"
-            "• Auto-Save for UI State\n"
-            "• Error Recovery System\n"
-            "• Project Onboarding"
+            "A modern Python IDE with AI-powered assistance."
         )
 
     def _auto_save_session(self):

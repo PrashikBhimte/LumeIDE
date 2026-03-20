@@ -144,10 +144,252 @@ TOOL_FUNCTIONS = {
 }
 
 
+# ============================================================================
+# OpenAI-Compatible Tool Definitions
+# ============================================================================
+
+def get_openai_tools() -> list:
+    """
+    Returns tool definitions in OpenAI-compatible format.
+    
+    This format works with:
+    - Groq (via OpenAI-compatible API)
+    - OpenRouter (via OpenAI-compatible API)
+    - Claude (via Anthropic's tool format, needs conversion)
+    - Gemini (via Google's function declaration format, needs conversion)
+    
+    Returns:
+        List of tool definition dictionaries compatible with OpenAI API
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read the contents of a file from the file system. Use this when you need to examine existing code or files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The absolute path to the file to read. Use forward slashes or os.path for cross-platform compatibility.",
+                        },
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write or overwrite content to a file. Creates parent directories if they don't exist. Use this when you need to create new files or update existing ones.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The absolute path to the file to write. Use forward slashes or os.path for cross-platform compatibility.",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The complete content to write to the file. Will replace existing content entirely.",
+                        },
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "create_directory",
+                "description": "Create a directory (folder) at the specified path. Creates all intermediate directories if needed (like 'mkdir -p').",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The absolute path of the directory to create.",
+                        },
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_directory",
+                "description": "List the contents of a directory. Shows both files and subdirectories with sizes for files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The absolute path of the directory to list.",
+                        },
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+    ]
+
+
+def get_gemini_tools() -> list:
+    """
+    Returns tool definitions in Google Gemini format.
+    
+    Returns:
+        List of function declarations compatible with Gemini API
+    """
+    return [
+        {
+            "function_declarations": [
+                {
+                    "name": "read_file",
+                    "description": "Read the contents of a file from the file system.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "The path to the file to read.",
+                            },
+                        },
+                        "required": ["path"],
+                    },
+                },
+                {
+                    "name": "write_file",
+                    "description": "Write or overwrite content to a file.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "The path to the file to write.",
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "The content to write.",
+                            },
+                        },
+                        "required": ["path", "content"],
+                    },
+                },
+                {
+                    "name": "create_directory",
+                    "description": "Create a directory.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "The path of the directory to create.",
+                            },
+                        },
+                        "required": ["path"],
+                    },
+                },
+                {
+                    "name": "list_directory",
+                    "description": "List directory contents.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "The path of the directory to list.",
+                            },
+                        },
+                        "required": ["path"],
+                    },
+                },
+            ]
+        }
+    ]
+
+
+def get_anthropic_tools() -> list:
+    """
+    Returns tool definitions in Anthropic Claude format.
+    
+    Returns:
+        List of tool definitions compatible with Claude API
+    """
+    return [
+        {
+            "name": "read_file",
+            "description": "Read the contents of a file from the file system.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The path to the file to read.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "write_file",
+            "description": "Write or overwrite content to a file.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The path to the file to write.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The content to write.",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+        },
+        {
+            "name": "create_directory",
+            "description": "Create a directory.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The path of the directory to create.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "list_directory",
+            "description": "List directory contents.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The path of the directory to list.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    ]
+
+
 __all__ = [
     'tool_read_file',
     'tool_write_file', 
     'tool_create_directory',
     'tool_list_directory',
     'TOOL_FUNCTIONS',
+    'get_openai_tools',
+    'get_gemini_tools',
+    'get_anthropic_tools',
 ]

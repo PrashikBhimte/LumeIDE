@@ -1,423 +1,729 @@
 """
-Aura Client Module for LumeIDE
+Multi-Model Orchestrator for LumeIDE
 
-Client for interacting with Google's Gemini models using the google-genai SDK.
-Handles AI-powered code generation and tool execution.
+A unified client that intelligently routes requests to different AI models
+based on user intent, with automatic failover and retry capabilities.
 
-Logging:
-    All operations are logged to stdout for debugging.
-    Use THOUGHT logs to see AI reasoning before tool execution.
+Features:
+- ModelRouter: Intent-based routing (Groq for Scan/List, Gemini for Build/Fix)
+- SafeRetry: Automatic retry with fallback to free models on rate limits
+- Context Injection: Updates system instructions for backup models
+- Standardized Tooling: OpenAI-compatible function calling format
 """
 
 import os
-import json
-import threading
-from dataclasses import dataclass, asdict
+import re
 from typing import Optional, List, Dict, Any, Callable
+from dataclasses import dataclass
+from enum import Enum
+from dotenv import load_dotenv
+from PyQt6.QtCore import QObject, pyqtSignal
 
-from PyQt6.QtCore import QObject, pyqtSignal, QThread
-
-# Use the google-genai SDK (NOT google-generativeai)
-from google import genai
-from google.genai import types
-
-from app.engine.tools import TOOL_FUNCTIONS
-from app.engine.utils.tool_utils import build_all_tool_declarations # <--- NEW IMPORT
+# Load environment variables
+load_dotenv()
 
 
 # ============================================================================
-# LOGGING UTILITIES
+# Model Configuration
 # ============================================================================
 
-def log_header(title: str):
-    """Print a formatted log header."""
-    print(f"\n{'='*70}")
-    print(f" {title}")
-    print(f"{'='*70}")
-
-def log_thought(tool_name: str, args: Dict[str, Any]):
-    """Print the AI's thought process before tool execution."""
-    print(f"\n[🤔 AI THOUGHT] I am going to call {tool_name} with:")
-    for key, value in args.items():
-        # Truncate long values for display
-        value_str = str(value)
-        if len(value_str) > 100:
-            value_str = value_str[:100] + "..."
-        print(f"    {key}: {value_str}")
-
-def log_tool_execution(tool_name: str, result: str):
-    """Print the result of tool execution."""
-    # Truncate long results
-    result_preview = result[:500] if len(result) > 500 else result
-    print(f"\n[🔧 TOOL RESULT] {tool_name}:")
-    print(f"    {result_preview}")
-    if len(result) > 500:
-        print(f"    ... (truncated, full result: {len(result)} chars)")
-
-def log_error(tool_name: str, error: str):
-    """Print an error during tool execution."""
-    print(f"\n[❌ TOOL ERROR] {tool_name}: {error}")
-
-def log_iteration(iteration: int, total: int, tool_name: str):
-    """Print iteration progress."""
-    print(f"\n[📍 ITERATION {iteration}/{total}] Processing tool: {tool_name}")
-
-
-# ============================================================================
-# DATA CLASSES
-# ============================================================================
-
-@dataclass
-class GenerationResult:
-    """Result of a generation request."""
-    text: Optional[str]
-    candidates: Optional[List[Any]] = None
-    prompt_feedback: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
+class ModelProvider(Enum):
+    """Supported AI model providers."""
+    GROQ = "groq"
+    GEMINI = "gemini"
+    OPENROUTER = "openrouter"
 
 
 @dataclass
-class ToolCall:
-    """Represents a tool call with its arguments."""
-    name: str
-    args: Dict[str, Any]
+class ModelConfig:
+    """Configuration for an AI model."""
+    provider: ModelProvider
+    model_id: str
+    api_key_env: str
+    base_url: Optional[str] = None
+    supports_streaming: bool = True
+    supports_functions: bool = True
+    is_free: bool = False
+
+
+# Model registry
+MODEL_REGISTRY: Dict[str, ModelConfig] = {
+    # Groq models (fast, good for scanning/listing)
+    "groq/llama-3.3-70b-versatile": ModelConfig(
+        provider=ModelProvider.GROQ,
+        model_id="llama-3.3-70b-versatile",
+        api_key_env="GROQ_API_KEY",
+        base_url="https://api.groq.com/openai/v1",
+    ),
+    "groq/llama-3.1-8b-instant": ModelConfig(
+        provider=ModelProvider.GROQ,
+        model_id="llama-3.1-8b-instant",
+        api_key_env="GROQ_API_KEY",
+        base_url="https://api.groq.com/openai/v1",
+    ),
     
-    def to_dict(self) -> Dict:
-        return asdict(self)
+    # Gemini models (powerful, good for building/fixing)
+    "gemini/gemini-2.0-flash": ModelConfig(
+        provider=ModelProvider.GEMINI,
+        model_id="gemini-2.0-flash",
+        api_key_env="GEMINI_API_KEY",
+    ),
+    "gemini/gemini-1.5-pro": ModelConfig(
+        provider=ModelProvider.GEMINI,
+        model_id="gemini-1.5-pro",
+        api_key_env="GEMINI_API_KEY",
+    ),
+    
+    # OpenRouter free models (fallback)
+    "openrouter/auto-free": ModelConfig(
+        provider=ModelProvider.OPENROUTER,
+        model_id="openrouter/auto",
+        api_key_env="OPENROUTER_API_KEY",
+        base_url="https://openrouter.ai/api/v1",
+        is_free=True,
+    ),
+}
 
 
 # ============================================================================
-# WORKER THREAD
+# Intent Detection
 # ============================================================================
 
-class AuraWorker(QObject):
-    """Worker thread for async generation."""
-    finished = pyqtSignal(object)
+class Intent(Enum):
+    """User intent categories."""
+    SCAN = "scan"      # Listing, exploring, reading
+    BUILD = "build"    # Creating, writing, generating code
+    FIX = "fix"        # Debugging, error fixing, refactoring
+    EXPLAIN = "explain"  # Asking questions, explanations
+    UNKNOWN = "unknown"
 
-    def __init__(self, client_instance, prompt_text, tools, system_instruction):
-        super().__init__()
-        self.client_instance = client_instance
-        self.prompt_text = prompt_text
-        self.tools = tools
-        self.system_instruction = system_instruction
 
-    def run(self):
-        result = self.client_instance.generate_response_sync(
-            self.prompt_text, 
-            self.tools, 
-            self.system_instruction
+INTENT_PATTERNS = {
+    Intent.SCAN: [
+        r'\b(scan|list|show|find|search|look|view|browse|read|get|check|inspect)\b',
+    ],
+    Intent.BUILD: [
+        r'\b(build|create|make|generate|add|new|write|implement)\b',
+    ],
+    Intent.FIX: [
+        r'\b(fix|debug|repair|resolve|error|bug|issue|problem|correct|patch|refactor)\b',
+    ],
+    Intent.EXPLAIN: [
+        r'\b(explain|what|how|why|tell|describe|understand|help)\b',
+    ],
+}
+
+
+def detect_intent(user_input: str) -> Intent:
+    """
+    Detect user intent from input text.
+    
+    Args:
+        user_input: The user's command/query
+        
+    Returns:
+        Detected Intent enum value
+    """
+    text_lower = user_input.lower().strip()
+    
+    # Check for exact command matches first
+    exact_matches = {
+        "scan": Intent.SCAN,
+        "list": Intent.SCAN,
+        "build": Intent.BUILD,
+        "fix": Intent.FIX,
+    }
+    
+    first_word = text_lower.split()[0] if text_lower.split() else ""
+    if first_word in exact_matches:
+        return exact_matches[first_word]
+    
+    # Pattern-based detection
+    for intent, patterns in INTENT_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return intent
+    
+    return Intent.UNKNOWN
+
+
+# ============================================================================
+# Model Router
+# ============================================================================
+
+@dataclass
+class RouteResult:
+    """Result of a routing decision."""
+    primary_model: str
+    fallback_model: str
+    intent: Intent
+    reason: str
+
+
+class ModelRouter:
+    """
+    Routes requests to appropriate models based on detected intent.
+    
+    Routing Strategy:
+    - Scan/List operations -> Groq (fast, cost-effective)
+    - Build/Fix operations -> Gemini (powerful reasoning)
+    - Rate limited requests -> OpenRouter free fallback
+    """
+    
+    # Intent to model mapping
+    INTENT_MODELS = {
+        Intent.SCAN: "groq/llama-3.3-70b-versatile",
+        Intent.BUILD: "gemini/gemini-2.0-flash",
+        Intent.FIX: "gemini/gemini-2.0-flash",
+        Intent.EXPLAIN: "gemini/gemini-2.0-flash",
+        Intent.UNKNOWN: "gemini/gemini-2.0-flash",
+    }
+    
+    FALLBACK_MODEL = "openrouter/auto-free"
+    
+    def __init__(self):
+        self._route_cache: Dict[str, RouteResult] = {}
+    
+    def route(self, user_input: str) -> RouteResult:
+        """
+        Determine the best model for the given input.
+        
+        Args:
+            user_input: The user's command/query
+            
+        Returns:
+            RouteResult with primary and fallback model recommendations
+        """
+        intent = detect_intent(user_input)
+        primary = self.INTENT_MODELS.get(intent, self.INTENT_MODELS[Intent.UNKNOWN])
+        
+        return RouteResult(
+            primary_model=primary,
+            fallback_model=self.FALLBACK_MODEL,
+            intent=intent,
+            reason=f"Intent '{intent.value}' routes to {primary.split('/')[0].upper()}",
         )
-        self.finished.emit(result)
+    
+    def get_model_config(self, model_key: str) -> Optional[ModelConfig]:
+        """Get configuration for a model."""
+        return MODEL_REGISTRY.get(model_key)
 
 
 # ============================================================================
-# MAIN AURA CLIENT
+# Safe Retry Handler
 # ============================================================================
 
-class AuraClient(QObject):
+@dataclass
+class RetryContext:
+    """Context for retry operations."""
+    original_model: str
+    current_model: str
+    attempt: int
+    max_attempts: int
+    last_error: Optional[str] = None
+    is_fallback: bool = False
+
+
+BACKUP_SYSTEM_INSTRUCTION = """You are a backup model for Lume IDE. The primary model hit a rate limit. Continue the task precisely.
+
+Important guidelines:
+1. Maintain consistency with any previous context or file modifications
+2. If you need to read files, use the read_file tool
+3. If you need to write files, use the write_file tool
+4. Be precise and complete in your task
+5. Do not re-explain what happened - just continue the work
+"""
+
+
+class SafeRetry:
     """
-    A client for interacting with Google's Gemini models.
-    Powered by the google-genai SDK.
+    Handles automatic retry with fallback on rate limit (429) or server (500) errors.
     
-    Supports tool calling for file operations and provides
-    signals for UI updates during generation.
-    
-    Logging:
-        All operations print to stdout for debugging.
-        Thought Logger shows AI reasoning before tool execution.
+    Strategy:
+    1. Try primary model
+    2. On 429/500 error, switch to openrouter/auto-free (free fallback)
+    3. Retry once with fallback
+    4. If still fails, propagate error
     """
     
-    # Signals for UI updates
+    RETRYABLE_ERRORS = {429, 500, 502, 503, 504}
+    MAX_RETRIES = 1
+    
+    def __init__(self, router: ModelRouter):
+        self.router = router
+        self.retry_history: List[RetryContext] = []
+    
+    def should_retry(self, error_code: int) -> bool:
+        """Check if an error is retryable."""
+        return error_code in self.RETRYABLE_ERRORS
+    
+    def get_retry_context(self, original_model: str, error_code: int) -> RetryContext:
+        """Create retry context for switching models."""
+        return RetryContext(
+            original_model=original_model,
+            current_model=self.router.FALLBACK_MODEL,
+            attempt=1,
+            max_attempts=self.MAX_RETRIES + 1,
+            last_error=f"HTTP {error_code}",
+            is_fallback=True,
+        )
+    
+    def get_backup_system_instruction(self, original_instruction: str) -> str:
+        """Get updated system instruction for backup model."""
+        return f"{original_instruction}\n\n{BACKUP_SYSTEM_INSTRUCTION}"
+    
+    def record_retry(self, context: RetryContext):
+        """Record retry attempt in history."""
+        self.retry_history.append(context)
+        if len(self.retry_history) > 50:
+            self.retry_history.pop(0)
+    
+    def get_last_retry(self) -> Optional[RetryContext]:
+        """Get the most recent retry context."""
+        return self.retry_history[-1] if self.retry_history else None
+
+
+# ============================================================================
+# API Client Abstraction
+# ============================================================================
+
+class APIClientBase:
+    """Base class for API clients."""
+    
+    def __init__(self, config: ModelConfig, system_instruction: str = ""):
+        self.config = config
+        self.system_instruction = system_instruction
+        self._client = None
+        self._init_client()
+    
+    def _init_client(self):
+        """Initialize the API client. Override in subclasses."""
+        raise NotImplementedError
+    
+    def send_message(self, messages: List[Dict[str, str]], 
+                     tools: Optional[List[Dict]] = None,
+                     stream: bool = True) -> Any:
+        """Send a message to the model. Override in subclasses."""
+        raise NotImplementedError
+    
+    def get_error_code(self, exception: Exception) -> Optional[int]:
+        """Extract error code from exception. Override in subclasses."""
+        raise NotImplementedError
+
+
+class GroqClient(APIClientBase):
+    """Groq API client using OpenAI-compatible interface."""
+    
+    def _init_client(self):
+        api_key = os.getenv(self.config.api_key_env)
+        if not api_key:
+            raise ValueError(f"Missing API key: {self.config.api_key_env}")
+        
+        try:
+            from openai import OpenAI
+            self._client = OpenAI(api_key=api_key, base_url=self.config.base_url)
+        except ImportError:
+            raise ImportError("openai package required for Groq. Install: pip install openai")
+    
+    def send_message(self, messages: List[Dict[str, str]], 
+                     tools: Optional[List[Dict]] = None,
+                     stream: bool = True) -> Any:
+        kwargs = {"model": self.config.model_id, "messages": messages, "stream": stream}
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        return self._client.chat.completions.create(**kwargs)
+    
+    def get_error_code(self, exception: Exception) -> Optional[int]:
+        error_str = str(exception).lower()
+        if "429" in error_str or "rate limit" in error_str:
+            return 429
+        if "500" in error_str or "internal server error" in error_str:
+            return 500
+        return None
+
+
+class GeminiClient(APIClientBase):
+    """Google Gemini API client."""
+    
+    def _init_client(self):
+        api_key = os.getenv(self.config.api_key_env)
+        if not api_key:
+            raise ValueError(f"Missing API key: {self.config.api_key_env}")
+        
+        try:
+            from google import genai
+            self._client = genai.Client(api_key=api_key)
+        except ImportError:
+            raise ImportError("google-genai package required. Install: pip install google-genai")
+    
+    def send_message(self, messages: List[Dict[str, str]], 
+                     tools: Optional[List[Dict]] = None,
+                     stream: bool = True) -> Any:
+        contents = []
+        for msg in messages:
+            if msg["role"] == "user":
+                contents.append({"role": "user", "parts": [{"text": msg["content"]}]})
+            elif msg["role"] == "assistant":
+                contents.append({"role": "model", "parts": [{"text": msg["content"]}]})
+        
+        config = {"generation_config": {"candidate_count": 1}}
+        if tools:
+            gemini_tools = self._convert_tools(tools)
+            config["tools"] = gemini_tools
+        
+        return self._client.models.generate_content(
+            model=self.config.model_id, contents=contents, config=config)
+    
+    def _convert_tools(self, tools: List[Dict]) -> List[Dict]:
+        gemini_tools = []
+        for tool in tools:
+            if tool.get("type") == "function":
+                func = tool.get("function", {})
+                gemini_tools.append({
+                    "function_declarations": [{
+                        "name": func.get("name"),
+                        "description": func.get("description"),
+                        "parameters": func.get("parameters", {}),
+                    }]
+                })
+        return gemini_tools
+    
+    def get_error_code(self, exception: Exception) -> Optional[int]:
+        error_str = str(exception).lower()
+        if "429" in error_str or "rate limit" in error_str:
+            return 429
+        if "500" in error_str or "internal server error" in error_str:
+            return 500
+        return None
+
+
+class OpenRouterClient(APIClientBase):
+    """OpenRouter API client for free model fallback."""
+    
+    def _init_client(self):
+        api_key = os.getenv(self.config.api_key_env, "sk-or-v1-placeholder")
+        try:
+            from openai import OpenAI
+            self._client = OpenAI(api_key=api_key, base_url=self.config.base_url)
+        except ImportError:
+            raise ImportError("openai package required. Install: pip install openai")
+    
+    def send_message(self, messages: List[Dict[str, str]], 
+                     tools: Optional[List[Dict]] = None,
+                     stream: bool = True) -> Any:
+        kwargs = {"model": self.config.model_id, "messages": messages, "stream": stream}
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        return self._client.chat.completions.create(**kwargs)
+    
+    def get_error_code(self, exception: Exception) -> Optional[int]:
+        error_str = str(exception).lower()
+        if "429" in error_str or "rate limit" in error_str:
+            return 429
+        if "500" in error_str or "internal server error" in error_str:
+            return 500
+        return None
+
+
+def create_api_client(config: ModelConfig, system_instruction: str = "") -> APIClientBase:
+    """Factory function to create API clients."""
+    clients = {
+        ModelProvider.GROQ: GroqClient,
+        ModelProvider.GEMINI: GeminiClient,
+        ModelProvider.OPENROUTER: OpenRouterClient,
+    }
+    client_class = clients.get(config.provider)
+    if not client_class:
+        raise ValueError(f"Unknown provider: {config.provider}")
+    return client_class(config, system_instruction)
+
+
+# ============================================================================
+# Tool Executor
+# ============================================================================
+
+class ToolExecutor:
+    """Executes tool calls returned by AI models."""
+    
+    def __init__(self):
+        self._tools = self._load_tools()
+    
+    def _load_tools(self) -> Dict[str, Callable]:
+        """Load available tool functions."""
+        from app.engine.tools import TOOL_FUNCTIONS
+        return TOOL_FUNCTIONS
+    
+    def execute(self, tool_name: str, arguments: Dict[str, Any]) -> str:
+        """Execute a tool call."""
+        tool_func = self._tools.get(tool_name)
+        if not tool_func:
+            return f"Error: Unknown tool '{tool_name}'"
+        try:
+            result = tool_func(**arguments)
+            return result if isinstance(result, str) else str(result)
+        except Exception as e:
+            return f"Error executing {tool_name}: {str(e)}"
+    
+    def execute_tool_calls(self, tool_calls: List[Dict]) -> List[Dict[str, Any]]:
+        """Execute multiple tool calls."""
+        results = []
+        for call in tool_calls:
+            if "function" in call:
+                func = call["function"]
+                tool_name = func["name"]
+                arguments = func.get("arguments", {})
+            else:
+                tool_name = call.get("name", call.get("id"))
+                arguments = call.get("parameters", call.get("args", {}))
+            
+            if isinstance(arguments, str):
+                import json
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    arguments = {}
+            
+            result = self.execute(tool_name, arguments)
+            results.append({
+                "tool_call_id": call.get("id", call.get("call_id")),
+                "tool_name": tool_name,
+                "result": result,
+            })
+        return results
+
+
+# ============================================================================
+# Multi-Model Orchestrator (Main Aura Client)
+# ============================================================================
+
+@dataclass
+class OrchestratorConfig:
+    """Configuration for the Multi-Model Orchestrator."""
+    default_system_instruction: str = (
+        "You are the Lume Architect, a world-class expert in software development. "
+        "You help users build, fix, and understand their code. "
+        "Use the available tools to read files, write code, create directories, and list contents. "
+        "Always be precise and helpful."
+    )
+    enable_routing: bool = True
+    enable_retry: bool = True
+    max_tool_iterations: int = 10
+
+
+class MultiModelOrchestrator(QObject):
+    """
+    Multi-Model Orchestrator - The main Aura Client for LumeIDE.
+    
+    Features:
+    - Intent-based model routing (Groq for scan, Gemini for build/fix)
+    - Automatic retry with free model fallback
+    - Standardized OpenAI-compatible tool format
+    - Tool execution with automatic loop handling
+    """
+    
+    # PyQt Signals
     started_thinking = pyqtSignal()
     tool_used = pyqtSignal(str, dict)
-    finished = pyqtSignal(object)
+    finished = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
     
-    def __init__(self, api_key: str = None, model_name: str = "gemini-2.5-flash"):
+    def __init__(self, config: Optional[OrchestratorConfig] = None):
         super().__init__()
-        
-        # Get API key from argument or environment
-        if api_key is None:
-            api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError(
-                "API key for Gemini must be provided either as an argument or "
-                "as the GEMINI_API_KEY environment variable."
-            )
-
-        self.api_key = api_key
-        self.model_name = model_name
-        self.client = None
-        self._abort_event = threading.Event()
-        
-        # Tool functions dictionary - keys MUST match function names EXACTLY
-        # These are the names the model will use when calling tools
-        self.tool_functions: Dict[str, Callable] = {
-            "read_file": TOOL_FUNCTIONS["read_file"],
-            "write_file": TOOL_FUNCTIONS["write_file"],
-            "create_directory": TOOL_FUNCTIONS["create_directory"],
-            "list_directory": TOOL_FUNCTIONS["list_directory"],
-        }
-        
-        self.thread = None
-        self.worker = None
-        self._is_streaming = False
-        self._verbose = True  # Enable verbose logging
-        
-        # Initialize the client
-        self._initialize_client()
-
-    def _initialize_client(self):
-        """Initialize the Gemini client using google-genai SDK."""
-        try:
-            self.client = genai.Client(api_key=self.api_key)
-            print(f"[✓] AuraClient initialized with model: {self.model_name}")
-        except Exception as e:
-            print(f"[✗] Error initializing Gemini client: {e}")
-            raise
-
-    def set_verbose(self, verbose: bool):
-        """Enable or disable verbose logging."""
-        self._verbose = verbose
-
-    def generate_response(
-        self,
-        prompt_text: str,
-        tools: List = None,
-        system_instruction: str = None
-    ):
-        """
-        Generate a response asynchronously using a worker thread.
-        
-        Args:
-            prompt_text: The user's prompt
-            tools: List of tool functions (optional, defaults to built-in tools)
-            system_instruction: System-level instructions
-        """
-        self.thread = QThread()
-        self.worker = AuraWorker(self, prompt_text, tools, system_instruction)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self.on_generation_finished)
-        self.thread.finished.connect(self.thread.deleteLater)
-        
+        self.config = config or OrchestratorConfig()
+        self.router = ModelRouter()
+        self.retry_handler = SafeRetry(self.router)
+        self.tool_executor = ToolExecutor()
+        self._is_generating = False
+        self._should_abort = False
+        self._messages: List[Dict[str, str]] = []
+    
+    def _get_api_client(self, model_key: str, system_instruction: str = None) -> APIClientBase:
+        """Get or create an API client for the specified model."""
+        model_config = self.router.get_model_config(model_key)
+        if not model_config:
+            raise ValueError(f"Unknown model: {model_key}")
+        instruction = system_instruction or self.config.default_system_instruction
+        return create_api_client(model_config, instruction)
+    
+    def _build_messages(self, prompt: str, system_instruction: str = None) -> List[Dict[str, str]]:
+        """Build message list for API call."""
+        messages = []
+        instruction = system_instruction or self.config.default_system_instruction
+        messages.append({"role": "system", "content": instruction})
+        messages.extend(self._messages)
+        messages.append({"role": "user", "content": prompt})
+        return messages
+    
+    def _get_openai_tools(self) -> list:
+        """Get tools in OpenAI-compatible format."""
+        from app.engine.tools import get_openai_tools
+        return get_openai_tools()
+    
+    def generate_response(self, prompt: str, system_instruction: str = None,
+                         stream: bool = True) -> Optional[str]:
+        """Generate a response using the appropriate model."""
+        self._is_generating = True
+        self._should_abort = False
         self.started_thinking.emit()
-        self.thread.start()
-
-    def on_generation_finished(self, result):
-        """Handle generation completion."""
-        self.finished.emit(result)
-        self.thread.quit()
-
-    def generate_response_sync(
-        self,
-        prompt_text: str,
-        tools: List = None,
-        system_instruction: str = None,
-        stream: bool = False 
-    ) -> GenerationResult:
-        """
-        Generate a response synchronously with tool execution support.
-        
-        Args:
-            prompt_text: The user's prompt
-            tools: List of tool functions
-            system_instruction: System-level instructions
-            stream: Whether to stream the response (not fully implemented)
-        
-        Returns:
-            GenerationResult with response text or error
-        
-        Logging:
-            Prints detailed logs of AI thoughts and tool execution.
-        """
-        log_header("AURA GENERATION START")
-        print(f"[📝 PROMPT]: {prompt_text[:200]}{'...' if len(prompt_text) > 200 else ''}")
-        if system_instruction:
-            print(f"[📋 SYSTEM INSTRUCTION]: {len(system_instruction)} chars")
-        print()
         
         try:
-            # Use built-in tools if none provided
-            if tools is None:
-                tools = list(self.tool_functions.values())
+            route = self.router.route(prompt)
+            print(f"[Aura] Routed to: {route.primary_model} ({route.reason})")
             
-            # Build function declarations for the API
-            function_declarations = self._build_function_declarations()
+            client = self._get_api_client(route.primary_model, system_instruction)
+            messages = self._build_messages(prompt, system_instruction)
+            tools = self._get_openai_tools()
             
-            # Configure generation with tools
-            config = types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                tools=[
-                    types.Tool(
-                        function_declarations=function_declarations
-                    )
-                ],
-                # Disable automatic function calling so we can handle it manually
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                temperature=0.2  # Lower temperature for coding consistency
-            )
-
-            # Create chat session
-            print("[💬] Creating chat session...")
-            chat = self.client.chats.create(
-                model=self.model_name,
-                config=config
-            )
+            response = self._execute_with_retry(client, messages, tools, route, stream)
             
-            # Send initial prompt
-            print("[📤] Sending initial prompt to Gemini...")
-            response = chat.send_message(prompt_text)
-            
-            print(f"[📥] Received response with {len(response.function_calls) if response.function_calls else 0} function calls")
-            print()
-
-            # Handle function calls in a loop
-            max_iterations = 10  # Prevent infinite loops
-            iteration = 0
-            total_tool_calls = []
-            
-            while response.function_calls and iteration < max_iterations:
-                iteration += 1
-                
-                # Get the first function call
-                function_call = response.function_calls[0]
-                tool_name = function_call.name
-                tool_args = dict(function_call.args) if function_call.args else {}
-                
-                # Log iteration
-                log_iteration(iteration, max_iterations, tool_name)
-                
-                # Store tool call for history
-                tool_call_record = ToolCall(name=tool_name, args=tool_args)
-                total_tool_calls.append(tool_call_record)
-                
-                # THOUGHT LOGGER: Show AI reasoning before execution
-                log_thought(tool_name, tool_args)
-                
-                # Print raw JSON of the function call
-                if self._verbose:
-                    print(f"\n[📄 RAW FUNCTION CALL JSON]:")
-                    print(json.dumps(tool_call_record.to_dict(), indent=2))
-                
-                # Emit signal for UI to show tool usage
-                self.tool_used.emit(tool_name, tool_args)
-
-                # Execute the tool with robust error handling
-                if tool_name in self.tool_functions:
-                    tool_function = self.tool_functions[tool_name]
-                    try:
-                        print(f"\n[⚙️  EXECUTING] Calling {tool_function.__name__}...")
-                        
-                        # Execute the tool function
-                        tool_result = tool_function(**tool_args)
-                        
-                        # Log successful execution
-                        log_tool_execution(tool_name, tool_result)
-                        
-                        # Send result back to the model
-                        print(f"\n[📤] Sending tool result back to Gemini...")
-                        response = chat.send_message(
-                            types.Part.from_function_response(
-                                name=tool_name,
-                                response={"result": str(tool_result)}
-                            )
-                        )
-                        
-                        print(f"[📥] Next response: {len(response.function_calls) if response.function_calls else 0} function calls remaining")
-                        
-                    except TypeError as e:
-                        # Handle wrong arguments passed to tool
-                        error_msg = f"Tool '{tool_name}' received invalid arguments: {tool_args}. Error: {str(e)}"
-                        log_error(tool_name, error_msg)
-                        print(f"\n[📤] Sending error back to Gemini...")
-                        response = chat.send_message(
-                            types.Part.from_function_response(
-                                name=tool_name,
-                                response={"error": error_msg}
-                            )
-                        )
-                    except Exception as e:
-                        # Catch any other tool execution errors
-                        error_msg = f"Error executing tool '{tool_name}': {str(e)}"
-                        log_error(tool_name, error_msg)
-                        print(f"\n[📤] Sending error back to Gemini...")
-                        response = chat.send_message(
-                            types.Part.from_function_response(
-                                name=tool_name,
-                                response={"error": error_msg}
-                            )
-                        )
-                else:
-                    # Unknown tool - report back to model
-                    error_msg = f"Unknown tool: '{tool_name}'. Available tools: {list(self.tool_functions.keys())}"
-                    print(f"\n[⚠️  UNKNOWN TOOL] {error_msg}")
-                    print(f"[📤] Sending error back to Gemini...")
-                    response = chat.send_message(
-                        types.Part.from_function_response(
-                            name=tool_name,
-                            response={"error": error_msg}
-                        )
-                    )
-                    break  # Exit loop on unknown tool
-                
-                print()
-            
-            if iteration >= max_iterations:
-                print(f"[⚠️  WARNING] Maximum tool call iterations ({max_iterations}) reached")
-            
-            # Log final response
-            log_header("AURA GENERATION COMPLETE")
-            print(f"[📊 SUMMARY]:")
-            print(f"    - Total iterations: {iteration}")
-            print(f"    - Total tool calls: {len(total_tool_calls)}")
-            for tc in total_tool_calls:
-                print(f"      • {tc.name}({list(tc.args.keys())})")
-            print(f"\n[💬 FINAL RESPONSE]:")
-            print("-" * 70)
-            final_text = response.text if hasattr(response, 'text') else None
-            if final_text:
-                print(final_text)
-            else:
-                print("(No text response)")
-            print("-" * 70)
-
-            return GenerationResult(
-                text=response.text if hasattr(response, 'text') else None,
-                candidates=getattr(response, 'candidates', None),
-                prompt_feedback=getattr(response, 'prompt_feedback', None)
-            )
-
+            if response:
+                self._messages.append({"role": "user", "content": prompt})
+                self._messages.append({"role": "assistant", "content": response})
+                if len(self._messages) > 20:
+                    self._messages = self._messages[-20:]
+                self.finished.emit(response)
+                return response
+            return None
+        
         except Exception as e:
-            error_msg = str(e)
-            log_header("AURA GENERATION ERROR")
-            print(f"[❌ ERROR]: {error_msg}")
-            import traceback
-            traceback.print_exc()
-            return GenerationResult(text=None, error=error_msg)
-
-    def _build_function_declarations(self) -> List[Dict]:
-        """
-        Build function declarations for the Gemini API.
-        These define the tool schema that the model uses.
-        """
-        # Dynamically build function declarations from TOOL_FUNCTIONS
-        return build_all_tool_declarations(self.tool_functions) # <--- MODIFIED LINE
-
-    def abort(self):
-        """
-        Abort the current generation request if streaming.
-        """
-        if self._is_streaming:
-            self._abort_event.set()
-            self._is_streaming = False
-            print("[⏹️  ABORT] Aura generation abort requested")
-
+            error_msg = f"Error generating response: {str(e)}"
+            print(f"[Aura] {error_msg}")
+            self.error_occurred.emit(error_msg)
+            return None
+        finally:
+            self._is_generating = False
+    
+    def _execute_with_retry(self, client: APIClientBase, messages: List[Dict[str, str]],
+                            tools: List[Dict], route: RouteResult, stream: bool) -> Optional[str]:
+        """Execute API call with retry logic."""
+        attempt = 0
+        current_client = client
+        current_messages = messages
+        system_instruction = self.config.default_system_instruction
+        
+        while attempt <= self.retry_handler.MAX_RETRIES:
+            try:
+                response = current_client.send_message(
+                    messages=current_messages, tools=tools, stream=stream)
+                result = self._process_response(response, current_messages, tools, stream)
+                return result
+            except Exception as e:
+                error_code = current_client.get_error_code(e)
+                if error_code and self.retry_handler.should_retry(error_code) and attempt < self.retry_handler.MAX_RETRIES:
+                    attempt += 1
+                    print(f"[Aura] Rate limit hit ({error_code}). Switching to fallback model...")
+                    fallback_config = self.router.get_model_config(route.fallback_model)
+                    if fallback_config:
+                        system_instruction = self.retry_handler.get_backup_system_instruction(
+                            self.config.default_system_instruction)
+                        current_client = create_api_client(fallback_config, system_instruction)
+                        current_messages = messages
+                        retry_context = self.retry_handler.get_retry_context(route.primary_model, error_code)
+                        self.retry_handler.record_retry(retry_context)
+                        continue
+                raise
+        return None
+    
+    def _process_response(self, response, messages: List[Dict[str, str]],
+                          tools: List[Dict], stream: bool) -> str:
+        """Process API response, handling tool calls."""
+        iteration = 0
+        while iteration < self.config.max_tool_iterations:
+            iteration += 1
+            response_text = ""
+            tool_calls = None
+            
+            if stream:
+                tool_calls_buffer = []
+                for chunk in response:
+                    if hasattr(chunk, "choices") and chunk.choices:
+                        choice = chunk.choices[0]
+                        if hasattr(choice, "delta"):
+                            delta = choice.delta
+                            if hasattr(delta, "content") and delta.content:
+                                response_text += delta.content
+                            if hasattr(delta, "tool_calls") and delta.tool_calls:
+                                tool_calls_buffer.extend(delta.tool_calls)
+                if tool_calls_buffer:
+                    tool_calls = self._format_tool_calls(tool_calls_buffer)
+            else:
+                if hasattr(response, "text"):
+                    response_text = response.text
+                elif hasattr(response, "choices"):
+                    for choice in response.choices:
+                        if hasattr(choice, "message"):
+                            msg = choice.message
+                            response_text = msg.content or ""
+                            tool_calls = msg.tool_calls
+            
+            if not tool_calls:
+                return response_text
+            
+            print(f"[Aura] Executing {len(tool_calls)} tool call(s)...")
+            tool_results = self.tool_executor.execute_tool_calls(tool_calls)
+            
+            messages.append({"role": "assistant", "content": response_text, "tool_calls": tool_calls})
+            for result in tool_results:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": result["tool_call_id"],
+                    "content": result["result"],
+                })
+                self.tool_used.emit(result["tool_name"], {"result": result["result"]})
+            
+            tool_summary = "\n".join([f"[{r['tool_name']}]: {r['result'][:200]}..." for r in tool_results])
+            return f"{response_text}\n\nTool Results:\n{tool_summary}"
+        return "Max tool iterations reached."
+    
+    def _format_tool_calls(self, tool_calls) -> List[Dict]:
+        """Format tool calls from streaming chunks."""
+        formatted = []
+        for tc in tool_calls:
+            if hasattr(tc, "function"):
+                formatted.append({
+                    "id": getattr(tc, "id", f"call_{len(formatted)}"),
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                })
+        return formatted
+    
+    def send_prompt(self, prompt: str, stream: bool = True) -> Optional[str]:
+        """Send a prompt and get a response (alias for generate_response)."""
+        return self.generate_response(prompt, stream=stream)
+    
     def is_generating(self) -> bool:
-        """
-        Check if a generation is currently in progress.
-        """
-        return self._is_streaming
+        """Check if currently generating a response."""
+        return self._is_generating
+    
+    def abort(self):
+        """Abort current generation."""
+        self._should_abort = True
+        self._is_generating = False
+    
+    def clear_history(self):
+        """Clear conversation history."""
+        self._messages.clear()
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get orchestrator statistics."""
+        return {
+            "total_retries": len(self.retry_handler.retry_history),
+            "conversation_length": len(self._messages),
+            "last_retry": self.retry_handler.get_last_retry().__dict__ if self.retry_handler.get_last_retry() else None,
+        }
 
 
-# Export for easy importing
-__all__ = ['AuraClient', 'GenerationResult', 'ToolCall', 'log_header', 'log_thought', 'log_tool_execution', 'log_error']
+# Backward compatibility alias
+AuraClient = MultiModelOrchestrator
+
+
+# ============================================================================
+# Module Exports
+# ============================================================================
+
+__all__ = [
+    'MultiModelOrchestrator', 'AuraClient', 'ModelRouter', 'SafeRetry',
+    'ModelProvider', 'ModelConfig', 'Intent', 'RouteResult', 'RetryContext',
+    'OrchestratorConfig', 'detect_intent', 'create_api_client',
+]

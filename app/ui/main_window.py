@@ -60,6 +60,9 @@ class MainWindow(QMainWindow):
         self._create_menus()
         self._create_toolbar()
         self._connect_signals()
+        
+        # Load last project from session and push to sidebar
+        self._restore_last_session()
 
         # Auto-save timer
         self._auto_save_timer = QTimer()
@@ -75,7 +78,7 @@ class MainWindow(QMainWindow):
 
         # Engine components
         self.venv_detector = VenvDetector()
-        self.editor_area = EditorArea() # Editor area needs to be created before dispatcher
+        self.editor_area = EditorArea()  # Editor area needs to be created before dispatcher
 
         # Try to initialize Aura client (may fail if no API key)
         self.aura_client = None
@@ -95,6 +98,46 @@ class MainWindow(QMainWindow):
         except ValueError:
             print("Gemini API key not configured. Aura features disabled.")
             self.aura_client = None
+        except Exception as e:
+            print(f"Failed to initialize Aura client: {e}")
+            self.aura_client = None
+
+    def _restore_last_session(self):
+        """
+        Restore the last session state including the last opened project.
+        This pushes the last_project path to the Sidebar explorer on startup.
+        """
+        try:
+            session = self.db.load_session()
+            
+            # Restore last project path and push to sidebar
+            last_project = session.get('last_project')
+            if last_project and os.path.exists(last_project):
+                self.current_project_path = last_project
+                self.project_context.root_path = last_project
+                
+                # Get project name and ID
+                project_name = os.path.basename(last_project)
+                self.current_project_id = self.db.register_project(project_name, last_project)
+                
+                # Push the path to the Sidebar explorer
+                self.sidebar.set_root_path(last_project)
+                
+                # Update status bar
+                self.status_label.setText(f"Project: {project_name}")
+                
+                # Detect venv
+                self._detect_venv()
+                
+                print(f"Restored last project: {last_project}")
+                
+                # Restore open tabs
+                open_tabs = session.get('open_tabs', [])
+                for file_path in open_tabs:
+                    if os.path.exists(file_path):
+                        self.editor_area.open_file(file_path)
+        except Exception as e:
+            print(f"Error restoring last session: {e}")
 
     def _setup_ui(self):
         """Setup the main UI layout."""
@@ -266,11 +309,11 @@ class MainWindow(QMainWindow):
         # Sidebar -> File operations
         self.sidebar.file_double_clicked.connect(self.editor_area.open_file)
 
-        # Editor area
+        # Editor area signals
         self.editor_area.file_saved.connect(self._on_file_saved)
         self.editor_area.tab_changed.connect(self._on_tab_changed)
 
-        # Aura client signals
+        # Aura client signals (only if client is initialized)
         if self.aura_client:
             self.aura_client.started_thinking.connect(
                 self.bottom_panel.shell.on_aura_started_thinking
@@ -281,6 +324,7 @@ class MainWindow(QMainWindow):
             )
 
     def _on_aura_tool_used(self, tool_name, tool_args):
+        """Handle Aura tool usage."""
         self.bottom_panel.shell.on_aura_tool_used(tool_name, tool_args)
         if tool_name == 'write_file':
             file_path = tool_args.get('file_path')
@@ -316,7 +360,7 @@ class MainWindow(QMainWindow):
         project_name = os.path.basename(normalized)
         self.current_project_id = self.db.register_project(project_name, normalized)
 
-        # Update sidebar
+        # Update sidebar - Push path to Sidebar explorer
         self.sidebar.set_root_path(normalized)
 
         # Detect venv
@@ -330,8 +374,8 @@ class MainWindow(QMainWindow):
         # Update status
         self.status_label.setText(f"Project: {project_name}")
 
-        # Load previous session if exists
-        self._load_session()
+        # Save current session
+        self._auto_save_session()
 
     def _detect_venv(self):
         """Auto-detect virtual environment."""
@@ -395,7 +439,7 @@ class MainWindow(QMainWindow):
 
     def _auto_save_session(self):
         """Auto-save session state."""
-        if not self.current_project_id:
+        if not self.current_project_path:
             return
 
         # Save open tabs
@@ -404,7 +448,7 @@ class MainWindow(QMainWindow):
         # Save window geometry
         geometry = self.saveGeometry().toBase64().data().decode()
 
-        # Save session
+        # Save session (includes last_project)
         self.db.save_session(
             project_path=self.current_project_path,
             open_tabs=open_tabs,
@@ -426,7 +470,7 @@ class MainWindow(QMainWindow):
         if geometry:
             try:
                 self.restoreGeometry(geometry.encode())
-            except:
+            except Exception:
                 pass
 
     def closeEvent(self, event):

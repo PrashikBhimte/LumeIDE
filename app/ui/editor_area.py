@@ -8,6 +8,8 @@ from PyQt6.QtGui import (
     QFont, QTextCursor, QColor, QTextFormat, QPainter, QPalette, QTextDocument
 )
 
+from app.ui.syntax_highlighter import SyntaxHighlighter
+
 
 class SearchBar(QWidget):
     search_requested = pyqtSignal(str, bool)
@@ -63,7 +65,7 @@ class LineNumberArea(QWidget):
 
 class CodeEditor(QPlainTextEdit):
     """
-    Simple code editor widget with file tracking.
+    Simple code editor widget with file tracking and syntax highlighting.
     """
     
     # Signals
@@ -78,16 +80,25 @@ class CodeEditor(QPlainTextEdit):
         self._setup_ui()
         self._connect_signals()
         self.updateLineNumberAreaWidth(0)
+        
+        # Setup syntax highlighter
+        self.highlighter = SyntaxHighlighter(self.document())
+        if file_path:
+            self.highlighter.set_file_path(file_path)
 
     def _setup_ui(self):
         """Initialize the editor UI."""
-        self.setFont(QFont("Consolas", 11))
+        self.setFont(QFont("Cascadia Code", 11))
         self.setStyleSheet("""
-            QTextEdit {
+            QPlainTextEdit {
                 background-color: #1E1E1E;
                 color: #D4D4D4;
                 border: none;
                 padding: 4px;
+                selection-background-color: #264F78;
+            }
+            QPlainTextEdit:focus {
+                border: none;
             }
         """)
     
@@ -160,17 +171,28 @@ class CodeEditor(QPlainTextEdit):
 
     def lineNumberAreaPaintEvent(self, event):
         painter = QPainter(self.lineNumberArea)
-        painter.fillRect(event.rect(), QColor("#22232e")) # Line number background
-
+        painter.fillRect(event.rect(), QColor("#1E1E1E"))  # Line number background (VS Code style)
+        
+        # VS Code uses slightly different colors for active line number
+        is_active = True  # Simplified - you could check if this is the current block
+        
         block = self.firstVisibleBlock()
         blockNumber = block.blockNumber()
         top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
         bottom = top + self.blockBoundingRect(block).height()
+        
+        cursor_block = self.textCursor().blockNumber()
 
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
                 number = str(blockNumber + 1)
-                painter.setPen(QColor("#545c7e")) # Line number color
+                
+                # VS Code style: active line number is brighter
+                if blockNumber == cursor_block:
+                    painter.setPen(QColor("#C6C6C6"))  # Active line number
+                else:
+                    painter.setPen(QColor("#858585"))   # Inactive line number
+                    
                 painter.drawText(0, int(top), self.lineNumberArea.width(), self.fontMetrics().height(),
                                  Qt.AlignmentFlag.AlignRight, number)
 
@@ -191,6 +213,10 @@ class CodeEditor(QPlainTextEdit):
             self.file_path = normalized
             self.original_content = content
             self.setPlainText(content)
+            
+            # Update syntax highlighter based on file type
+            self.highlighter.set_file_path(normalized)
+            
             return True
         except Exception as e:
             return False, str(e)
@@ -271,9 +297,40 @@ class EditorArea(QWidget):
         self.tabs.tabCloseRequested.connect(self._on_tab_close)
         self.tabs.currentChanged.connect(self._on_current_changed)
         
+        # VS Code-style tab bar
         self.tabs.setStyleSheet("""
+            QTabBar::tab {
+                background-color: #2D2D2D;
+                color: #CCCCCC;
+                border: none;
+                padding: 8px 12px;
+                margin: 0px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }
             QTabBar::tab:!selected {
-                border-right: 1px solid #2a2b37;
+                background-color: #252526;
+                color: #969696;
+                border-bottom: 1px solid #2D2D2D;
+            }
+            QTabBar::tab:selected {
+                background-color: #1E1E1E;
+                color: #FFFFFF;
+                border-bottom: 1px solid #1E1E1E;
+            }
+            QTabBar::tab:hover:!selected {
+                background-color: #2A2A2A;
+                color: #CCCCCC;
+            }
+            QTabBar::tab:first {
+                border-top-left-radius: 0px;
+            }
+            QTabWidget::pane {
+                border: 1px solid #1E1E1E;
+                background-color: #1E1E1E;
+            }
+            QTabWidget {
+                background-color: #1E1E1E;
             }
         """)
         
@@ -341,6 +398,7 @@ class EditorArea(QWidget):
         import os
         normalized = os.path.normpath(file_path)
         
+        # Check if file is already open
         for i in range(self.tabs.count()):
             widget = self.tabs.widget(i)
             if isinstance(widget, CodeEditor) and widget.file_path == normalized:
@@ -348,13 +406,16 @@ class EditorArea(QWidget):
                 return True
         
         editor = CodeEditor(normalized)
-        if not editor.load_file(normalized):
+        success = editor.load_file(normalized)
+        if not success:
             return False
         
+        # Show modified indicator if file was modified externally
         file_name = editor.get_file_name()
         index = self.tabs.addTab(editor, file_name)
         self.tabs.setCurrentIndex(index)
         
+        # Remove welcome tab when opening first file
         if self.tabs.widget(0) == self.welcome_widget:
             self.tabs.removeTab(0)
 
@@ -367,6 +428,7 @@ class EditorArea(QWidget):
             if success:
                 self.file_saved.emit(widget.file_path)
                 index = self.tabs.currentIndex()
+                # Update tab text (remove * if present)
                 self.tabs.setTabText(index, widget.get_file_name())
             return success
         return False

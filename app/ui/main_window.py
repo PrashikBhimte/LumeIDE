@@ -8,6 +8,7 @@ Orchestrator that assembles all UI components:
 - Bottom Panel (Unified Shell + Log Viewer)
 
 Manages the overall layout and coordinates between components.
+VS Code-inspired dark theme throughout.
 """
 
 import os
@@ -19,7 +20,7 @@ from PyQt6.QtWidgets import (
     QToolBar, QStatusBar, QDockWidget, QProgressBar, QLabel
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QKeySequence, QAction
+from PyQt6.QtGui import QKeySequence, QAction, QFont
 
 # Import UI components
 from app.ui.activity_bar import ActivityBar
@@ -39,12 +40,16 @@ from app.ui.onboarding import ProjectOnboardingDialog
 class MainWindow(QMainWindow):
     """
     Main IDE Window - Orchestrator that assembles all components.
+    VS Code-inspired layout with activity bar, sidebar, editor, and terminal.
     """
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Lume IDE")
-        self.resize(1200, 800)
+        self.resize(1400, 900)
+        
+        # Set window minimum size
+        self.setMinimumSize(800, 600)
 
         # Core state
         self.current_project_path = None
@@ -60,6 +65,7 @@ class MainWindow(QMainWindow):
         self._create_menus()
         self._create_toolbar()
         self._connect_signals()
+        self._apply_styles()
         
         # Load last project from session and push to sidebar
         self._restore_last_session()
@@ -105,7 +111,6 @@ class MainWindow(QMainWindow):
     def _restore_last_session(self):
         """
         Restore the last session state including the last opened project.
-        This pushes the last_project path to the Sidebar explorer on startup.
         """
         try:
             session = self.db.load_session()
@@ -123,6 +128,9 @@ class MainWindow(QMainWindow):
                 # Push the path to the Sidebar explorer
                 self.sidebar.set_root_path(last_project)
                 
+                # Update bottom panel prompt
+                self.bottom_panel.set_project_path(last_project)
+                
                 # Update status bar
                 self.status_label.setText(f"Project: {project_name}")
                 
@@ -139,6 +147,96 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Error restoring last session: {e}")
 
+    def _apply_styles(self):
+        """Apply VS Code-inspired dark theme styles."""
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #1E1E1E;
+            }
+            QWidget {
+                background-color: #1E1E1E;
+                color: #D4D4D4;
+            }
+            QMenuBar {
+                background-color: #252526;
+                color: #CCCCCC;
+                border-bottom: 1px solid #3C3C3C;
+            }
+            QMenuBar::item {
+                padding: 6px 12px;
+            }
+            QMenuBar::item:selected {
+                background-color: #2A2D2E;
+            }
+            QMenu {
+                background-color: #252526;
+                color: #CCCCCC;
+                border: 1px solid #3C3C3C;
+            }
+            QMenu::item {
+                padding: 6px 24px;
+            }
+            QMenu::item:selected {
+                background-color: #094771;
+            }
+            QToolBar {
+                background-color: #252526;
+                border: none;
+                spacing: 4px;
+                padding: 4px;
+            }
+            QStatusBar {
+                background-color: #007ACC;
+                color: #FFFFFF;
+                border-top: 1px solid #3C3C3C;
+            }
+            QDockWidget {
+                background-color: #252526;
+                titlebar-close-icon: url(close.png);
+                border: 1px solid #3C3C3C;
+            }
+            QDockWidget::title {
+                background-color: #252526;
+                padding: 6px;
+                border-bottom: 1px solid #3C3C3C;
+            }
+            QLabel {
+                background-color: transparent;
+            }
+            QScrollBar:vertical {
+                background-color: #1E1E1E;
+                width: 14px;
+                border: none;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #424242;
+                min-height: 20px;
+                border-radius: 7px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #4F4F4F;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar:horizontal {
+                background-color: #1E1E1E;
+                height: 14px;
+                border: none;
+            }
+            QScrollBar::handle:horizontal {
+                background-color: #424242;
+                min-width: 20px;
+                border-radius: 7px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background-color: #4F4F4F;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+        """)
+
     def _setup_ui(self):
         """Setup the main UI layout."""
         # Central widget with splitter
@@ -150,7 +248,6 @@ class MainWindow(QMainWindow):
 
         # Activity bar (left icon navigation)
         self.activity_bar = ActivityBar()
-        self.activity_bar.setFixedWidth(48)
         main_layout.addWidget(self.activity_bar)
 
         # Horizontal splitter for sidebar and editor
@@ -158,7 +255,7 @@ class MainWindow(QMainWindow):
 
         # Sidebar (Explorer)
         self.sidebar = Sidebar()
-        self.sidebar.setMinimumWidth(200)
+        self.sidebar.setMinimumWidth(180)
         self.sidebar.setMaximumWidth(400)
         horizontal_splitter.addWidget(self.sidebar)
 
@@ -167,20 +264,28 @@ class MainWindow(QMainWindow):
 
         # Set initial sizes
         horizontal_splitter.setStretchFactor(0, 1)  # Sidebar
-        horizontal_splitter.setStretchFactor(1, 3)  # Editor
+        horizontal_splitter.setStretchFactor(1, 4)  # Editor
+        horizontal_splitter.setSizes([250, 800])
 
         main_layout.addWidget(horizontal_splitter, stretch=1)
 
         # Bottom panel (Unified Shell + Log Viewer)
-        self.bottom_panel = BottomPanel(command_dispatcher=self.command_dispatcher)
+        self.bottom_panel = BottomPanel(
+            command_dispatcher=self.command_dispatcher,
+            project_path=self.current_project_path
+        )
         self.bottom_panel.setMinimumHeight(150)
-        self.bottom_panel.setMaximumHeight(400)
+        self.bottom_panel.setMaximumHeight(500)
 
         # Create dock for bottom panel
-        self.bottom_dock = QDockWidget("Output", self)
+        self.bottom_dock = QDockWidget("", self)
         self.bottom_dock.setWidget(self.bottom_panel)
         self.bottom_dock.setAllowedAreas(Qt.DockWidgetArea.BottomDockWidgetArea)
+        self.bottom_dock.setTitleBarWidget(QWidget())  # Hide title bar
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.bottom_dock)
+        
+        # Set initial height
+        self.bottom_dock.setFixedHeight(250)
 
         # Status bar
         self._setup_statusbar()
@@ -192,9 +297,11 @@ class MainWindow(QMainWindow):
 
         self.status_label = QLabel("Ready")
         self.statusBar.addPermanentWidget(self.status_label)
+        self.status_label.setStyleSheet("color: white; padding: 0 8px;")
 
         self.venv_label = QLabel("No venv")
         self.statusBar.addPermanentWidget(self.venv_label)
+        self.venv_label.setStyleSheet("color: white; padding: 0 8px;")
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setMaximumWidth(150)
@@ -208,7 +315,7 @@ class MainWindow(QMainWindow):
         # File menu
         file_menu = menubar.addMenu("&File")
 
-        open_folder_action = QAction("&Open Folder...", self)
+        open_folder_action = QAction("Open Folder...", self)
         open_folder_action.setShortcut(QKeySequence.StandardKey.Open)
         open_folder_action.triggered.connect(self.open_folder)
         file_menu.addAction(open_folder_action)
@@ -227,22 +334,61 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
+        close_tab_action = QAction("Close Editor", self)
+        close_tab_action.setShortcut(QKeySequence("Ctrl+W"))
+        close_tab_action.triggered.connect(lambda: self.editor_area._on_tab_close(self.editor_area.tabs.currentIndex()))
+        file_menu.addAction(close_tab_action)
+
+        file_menu.addSeparator()
+
         exit_action = QAction("E&xit", self)
         exit_action.setShortcut(QKeySequence.StandardKey.Quit)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
+        # Edit menu
+        edit_menu = menubar.addMenu("&Edit")
+
+        undo_action = QAction("Undo", self)
+        undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        edit_menu.addAction(undo_action)
+
+        redo_action = QAction("Redo", self)
+        redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        edit_menu.addAction(redo_action)
+
+        edit_menu.addSeparator()
+
+        cut_action = QAction("Cut", self)
+        cut_action.setShortcut(QKeySequence.StandardKey.Cut)
+        edit_menu.addAction(cut_action)
+
+        copy_action = QAction("Copy", self)
+        copy_action.setShortcut(QKeySequence.StandardKey.Copy)
+        edit_menu.addAction(copy_action)
+
+        paste_action = QAction("Paste", self)
+        paste_action.setShortcut(QKeySequence.StandardKey.Paste)
+        edit_menu.addAction(paste_action)
+
+        edit_menu.addSeparator()
+
+        find_action = QAction("Find", self)
+        find_action.setShortcut(QKeySequence("Ctrl+F"))
+        find_action.triggered.connect(lambda: self.editor_area.toggle_search_bar())
+        edit_menu.addAction(find_action)
+
         # View menu
         view_menu = menubar.addMenu("&View")
 
-        toggle_sidebar_action = QAction("Toggle &Sidebar", self)
+        toggle_sidebar_action = QAction("Toggle Sidebar", self)
         toggle_sidebar_action.setShortcut(QKeySequence("Ctrl+B"))
         toggle_sidebar_action.triggered.connect(
             lambda: self.sidebar.setVisible(not self.sidebar.isVisible())
         )
         view_menu.addAction(toggle_sidebar_action)
 
-        toggle_terminal_action = QAction("Toggle &Terminal", self)
+        toggle_terminal_action = QAction("Toggle Terminal", self)
         toggle_terminal_action.setShortcut(QKeySequence("Ctrl+`"))
         toggle_terminal_action.triggered.connect(
             lambda: self.bottom_dock.setVisible(not self.bottom_dock.isVisible())
@@ -252,18 +398,18 @@ class MainWindow(QMainWindow):
         # Project menu
         project_menu = menubar.addMenu("&Project")
 
-        project_settings_action = QAction("&Project Settings...", self)
+        project_settings_action = QAction("Project Settings...", self)
         project_settings_action.triggered.connect(self._show_project_settings)
         project_menu.addAction(project_settings_action)
 
-        detect_venv_action = QAction("&Detect Virtual Environment", self)
+        detect_venv_action = QAction("Detect Virtual Environment", self)
         detect_venv_action.triggered.connect(self._detect_venv)
         project_menu.addAction(detect_venv_action)
 
         # Help menu
         help_menu = menubar.addMenu("&Help")
 
-        about_action = QAction("&About LumeIDE", self)
+        about_action = QAction("About LumeIDE", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
 
@@ -271,11 +417,12 @@ class MainWindow(QMainWindow):
         """Create the toolbar."""
         toolbar = QToolBar("Main Toolbar")
         toolbar.setMovable(False)
+        toolbar.setIconSize(QWidget().sizeHint())
         self.addToolBar(toolbar)
 
         # Open folder
         open_action = QAction("📂", self)
-        open_action.setToolTip("Open Folder")
+        open_action.setToolTip("Open Folder (Ctrl+O)")
         open_action.triggered.connect(self.open_folder)
         toolbar.addAction(open_action)
 
@@ -283,23 +430,33 @@ class MainWindow(QMainWindow):
 
         # Save
         save_action = QAction("💾", self)
-        save_action.setToolTip("Save File")
+        save_action.setToolTip("Save File (Ctrl+S)")
         save_action.triggered.connect(self.editor_area.save_current)
         toolbar.addAction(save_action)
 
         toolbar.addSeparator()
 
         # Run
-        run_action = QAction("▶️", self)
-        run_action.setToolTip("Run Python File")
+        run_action = QAction("▶", self)
+        run_action.setToolTip("Run File")
         run_action.triggered.connect(lambda: self.command_dispatcher.dispatch("run this"))
         toolbar.addAction(run_action)
 
         # Stop
-        stop_action = QAction("⏹️", self)
+        stop_action = QAction("⏹", self)
         stop_action.setToolTip("Stop Execution")
         stop_action.triggered.connect(self._stop_execution)
         toolbar.addAction(stop_action)
+
+        toolbar.addSeparator()
+
+        # Toggle terminal
+        terminal_action = QAction("⫶", self)
+        terminal_action.setToolTip("Toggle Terminal (Ctrl+`)")
+        terminal_action.triggered.connect(
+            lambda: self.bottom_dock.setVisible(not self.bottom_dock.isVisible())
+        )
+        toolbar.addAction(terminal_action)
 
     def _connect_signals(self):
         """Connect signals between components."""
@@ -316,12 +473,17 @@ class MainWindow(QMainWindow):
         # Aura client signals (only if client is initialized)
         if self.aura_client:
             self.aura_client.started_thinking.connect(
-                self.bottom_panel.shell.on_aura_started_thinking
+                self._on_aura_started_thinking
             )
             self.aura_client.tool_used.connect(self._on_aura_tool_used)
             self.aura_client.finished.connect(
-                self.bottom_panel.shell.on_aura_finished
+                self._on_aura_finished
             )
+
+    def _on_aura_started_thinking(self):
+        """Handle Aura started thinking."""
+        self.activity_bar.set_ai_active(True)
+        self.bottom_panel.shell.on_aura_started_thinking()
 
     def _on_aura_tool_used(self, tool_name, tool_args):
         """Handle Aura tool usage."""
@@ -331,16 +493,24 @@ class MainWindow(QMainWindow):
             if file_path:
                 self.editor_area.open_file(file_path)
 
+    def _on_aura_finished(self, result):
+        """Handle Aura finished."""
+        self.activity_bar.set_ai_active(False)
+        self.bottom_panel.shell.on_aura_finished(result)
+
     def _on_view_changed(self, view_id: str):
         """Handle activity bar view changes."""
         if view_id == 'explorer':
             self.sidebar.show_explorer()
-        elif view_id == 'settings':
-            self._show_project_settings()
+        elif view_id == 'aura':
+            # Focus on terminal for AI input
+            self.bottom_dock.setVisible(True)
+            self.bottom_panel.show_shell()
+            self.bottom_panel.shell.focus_input()
 
     def _on_file_saved(self, file_path: str):
         """Handle file saved event."""
-        self.bottom_panel.append_output(f"Saved: {os.path.basename(file_path)}", "green")
+        self.bottom_panel.append_output(f"Saved: {os.path.basename(file_path)}", "success")
 
     def _on_tab_changed(self, index: int):
         """Handle tab change."""
@@ -362,6 +532,9 @@ class MainWindow(QMainWindow):
 
         # Update sidebar - Push path to Sidebar explorer
         self.sidebar.set_root_path(normalized)
+
+        # Update bottom panel prompt
+        self.bottom_panel.set_project_path(normalized)
 
         # Detect venv
         self._detect_venv()
@@ -388,7 +561,7 @@ class MainWindow(QMainWindow):
             self.project_context.venv_path = normalized_venv
             self.venv_label.setText(f"venv: {venv_info['name']}")
             self.bottom_panel.append_output(
-                f"Detected venv: {normalized_venv}", "green"
+                f"Detected venv: {normalized_venv}", "success"
             )
         else:
             self.project_context.venv_path = None
@@ -403,7 +576,7 @@ class MainWindow(QMainWindow):
     def _on_project_configured(self, config: dict):
         """Handle project configuration."""
         self.bottom_panel.append_output(
-            f"Project configured: {config['project_name']}", "green"
+            f"Project configured: {config['project_name']}", "success"
         )
 
         # Install packages if specified
@@ -414,10 +587,9 @@ class MainWindow(QMainWindow):
 
     def _stop_execution(self):
         """Stop current execution."""
-        # This might need to be re-wired to the dispatcher if it handles long-running processes
         if self.aura_client and self.aura_client.is_generating():
             self.aura_client.abort()
-            self.bottom_panel.append_output("Aura generation stopped.", "red")
+            self.bottom_panel.append_output("Aura generation stopped.", "error")
 
     def _show_project_settings(self):
         """Show project settings."""
@@ -433,8 +605,9 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "About LumeIDE",
-            "LumeIDE\n\n"
-            "A modern Python IDE with AI-powered assistance."
+            "<h3>LumeIDE</h3>"
+            "<p>A modern Python IDE with AI-powered assistance.</p>"
+            "<p>Built with PyQt6 and powered by Aura AI.</p>"
         )
 
     def _auto_save_session(self):
